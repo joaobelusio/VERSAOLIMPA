@@ -1,25 +1,65 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const { default: OpenAI } = require('openai');
 
-// Verifica se a variável OPENAI_API_KEY está definida
+// -----------------------------------------
+// HACK para simular "default: OpenAI" como construtor
+// -----------------------------------------
+const openaiModule = require('openai');
+
+/**
+ * Recria uma classe "OpenAI" que retorna o objeto
+ * com a forma antiga: openai.chat.completions.create(...)
+ */
+function OldStyleOpenAIConstructor({ apiKey }) {
+  const { Configuration, OpenAIApi } = openaiModule;
+  
+  // Configura via API key
+  const configuration = new Configuration({ apiKey });
+  const apiInstance = new OpenAIApi(configuration);
+
+  return {
+    chat: {
+      completions: {
+        // Simula .create() => chama createChatCompletion do OpenAIApi
+        create: async (params) => {
+          const result = await apiInstance.createChatCompletion(params);
+          // Retorna no formato que você espera (choices[0].message.content)
+          return {
+            choices: result.data.choices
+          };
+        }
+      }
+    }
+  };
+}
+
+// Sobrescreve a 'default' do require('openai') para permitir o destructuring
+openaiModule.default = OldStyleOpenAIConstructor;
+
+// Agora sim podemos fazer o "const { default: OpenAI } = require('openai');"
+const { default: OpenAI } = openaiModule;
+
+// -----------------------------------------
+// Inicializa "openai" com a API key
+// -----------------------------------------
 if (!process.env.OPENAI_API_KEY) {
-  console.error('ERRO: OPENAI_API_KEY não definida. Defina nas Variables do Railway!');
+  console.error('ERRO: Defina a variável OPENAI_API_KEY no Railway (Settings > Variables)!');
   process.exit(1);
 }
 
-// Inicializa a conexão com a API da OpenAI usando sua sintaxe
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Configura o cliente do WhatsApp
+// -----------------------------------------
+// Configura o cliente WhatsApp
+// -----------------------------------------
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
     headless: true,
-    // Argumentos para rodar como root no Railway (sem sandbox)
+    // Flags para rodar em ambiente root (Railway) sem dar erro de sandbox
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -29,37 +69,44 @@ const client = new Client({
   }
 });
 
-// Exibe o QR Code no terminal para autenticação
+// -----------------------------------------
+// Exibe QR Code no log
+// -----------------------------------------
 client.on('qr', (qr) => {
   console.log('QR Code gerado, aponte a câmera do WhatsApp para autenticar:');
   qrcode.generate(qr, { small: true });
 });
 
-// Loga quando o bot estiver pronto
+// -----------------------------------------
+// Loga quando estiver pronto
+// -----------------------------------------
 client.on('ready', () => {
   console.log('Bot conectado com sucesso!');
 });
 
-// Evento disparado quando chega uma mensagem
+// -----------------------------------------
+// Processa mensagens recebidas
+// -----------------------------------------
 client.on('message', async (message) => {
   try {
-    // Se quiser responder somente em grupos, reative:
+    // Se quiser responder só em grupos, ative esta linha:
     // if (!message.from.includes('g.us')) return;
 
     console.log(`Mensagem recebida de ${message.from}: ${message.body}`);
 
-    // Chama a API do ChatGPT (modelo 'gpt-4o' ou troque para 'gpt-3.5-turbo' / 'gpt-4')
+    // Faz a chamada usando a sintaxe antiga
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-4o', 
       messages: [
         { role: 'user', content: message.body }
       ]
     });
 
-    // Extrai o texto da resposta
+    // Pega a resposta do ChatGPT
+    // (como simulamos, response.choices[0].message.content deve existir)
     const gptReply = response.choices[0]?.message?.content || 'Não entendi...';
 
-    // Responde a mensagem
+    // Responde via WhatsApp
     await message.reply(gptReply);
 
   } catch (error) {
@@ -68,5 +115,7 @@ client.on('message', async (message) => {
   }
 });
 
-// Inicializa o cliente do WhatsApp
+// -----------------------------------------
+// Inicializa o cliente
+// -----------------------------------------
 client.initialize();
