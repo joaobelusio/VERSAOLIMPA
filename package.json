@@ -1,26 +1,13 @@
 {
-  "name": "nunca-funfa",
+  "name": "whatsapp-openai-bot",
   "version": "1.0.0",
-  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/joaobelusio/naoFunfaaa.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/joaobelusio/naoFunfaaa/issues"
-  },
-  "homepage": "https://github.com/joaobelusio/naoFunfaaa#readme",
-  "description": "",
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "openai": "^4.85.1",
+    "dotenv": "^16.0.0",
+    "openai": "^3.2.1",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.26.0"
+    "whatsapp-web.js": "^1.19.5"
   }
 }
