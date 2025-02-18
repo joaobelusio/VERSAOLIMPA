@@ -3,6 +3,12 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { default: OpenAI } = require('openai');
 
+// Verifica se a variável OPENAI_API_KEY está definida
+if (!process.env.OPENAI_API_KEY) {
+  console.error('Erro: OPENAI_API_KEY não está definida no arquivo .env');
+  process.exit(1);
+}
+
 // Inicializa a conexão com a API da OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -27,25 +33,25 @@ client.on('ready', () => {
 // Evento disparado quando chega uma mensagem
 client.on('message', async (message) => {
   try {
-    // Exemplo: responde apenas se for no grupo (ID contendo 'g.us'), 
-    // mas se quiser responder a todas as mensagens, remova essa verificação.
-    if (message.from.includes('g.us')) {
-      console.log(`Mensagem recebida no grupo ${message.from}: ${message.body}`);
+    // Caso queira responder APENAS em grupos, ative a linha abaixo:
+    // if (!message.from.includes('g.us')) return;
 
-      // Chama a API do ChatGPT (modelo gpt-4o)
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o', // Ajuste se necessário para 'gpt-4' ou outro modelo
-        messages: [
-          { role: 'user', content: message.body }
-        ]
-      });
+    console.log(`Mensagem recebida de ${message.from}: ${message.body}`);
 
-      // Extrai o texto da resposta
-      const gptReply = response.choices[0]?.message?.content || 'Não entendi...';
+    // Chama a API do ChatGPT (modelo gpt-4o, altere se necessário para 'gpt-4' ou 'gpt-3.5-turbo')
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o', 
+      messages: [
+        { role: 'user', content: message.body }
+      ]
+    });
 
-      // Envia a resposta de volta no grupo
-      message.reply(gptReply);
-    }
+    // Extrai o texto da resposta
+    const gptReply = response.choices[0]?.message?.content || 'Não entendi...';
+
+    // Envia a resposta
+    await message.reply(gptReply);
+
   } catch (error) {
     console.error('Erro ao processar mensagem com ChatGPT:', error);
     message.reply('Desculpe, ocorreu um erro ao processar sua solicitação.');
