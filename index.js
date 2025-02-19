@@ -52,7 +52,7 @@ const pool = new Pool({
 // ===============================
 const redis = require('redis');
 const redisClient = redis.createClient({
-  url: "redis://default:JWnSISLuVfDxjlfqcoNKokfMRkqOcqsv@redis.railway.internal:6379"
+  url: process.env.REDIS_URL // "redis://default:senha@redis.railway.internal:6379"
 });
 redisClient.on('error', (err) => console.error('Erro no Redis:', err));
 redisClient.on('connect', () => console.log('Redis: conectando...'));
@@ -68,13 +68,13 @@ async function initRedis() {
 // ===============================
 // 4) Funções para armazenar/ler histórico no Redis
 // ===============================
-const MAX_MESSAGES = 6; // quantas mensagens recentes manter (3 turnos)
+const MAX_MESSAGES = 6; // quantas mensagens recentes manter
 
 async function getConversationHistory(userNumber) {
   const key = `conversationHistory:${userNumber}`;
   const json = await redisClient.get(key);
   if (!json) {
-    return []; // sem histórico
+    return [];
   }
   try {
     return JSON.parse(json);
@@ -174,7 +174,7 @@ async function initDB() {
 }
 
 // ===============================
-// 6) System Prompt "forte"
+// 6) System Prompt
 // ===============================
 const systemPrompt = `
 Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados **PostgreSQL**.
@@ -221,92 +221,94 @@ Você é um assistente que gerencia estoque e vendas de produtos à base de CBD 
 ### Regras:
 1) Sempre responda com uma frase explicando o que entendeu/fará + um bloco de JSON \`\`\`.
 2) Se faltarem dados, peça ao usuário e use "operation":"NONE".
-3) Se o usuário falar "dar alta de X frascos" ou "quero vender Y frascos", isso significa "operation_type":"SAÍDA".
+3) Se o usuário falar "dar alta de X frascos" ou "quero vender Y frascos", é "operation_type":"SAÍDA".
 4) Se falar "comprei" ou "entrada", é "operation_type":"ENTRADA".
-5) Se o usuário der um nome de produto informal (ex: "1drop 6000fs"), você deve converter para o canonical_name mais próximo (ex: "1Drop 6000mg Full Spectrum 30ml"). 
-   Se não tiver 100% de certeza, pergunte.
-6) Para SELECT, se o usuário disser "estoque atual", faça "operation":"SELECT", "table":"inventory", "where": { "brand":"...", "product_name":"..." }.
-7) Se o usuário mandar algo genérico como "quanto vendemos em abril", use "operation":"SELECT", "table":"transactions", e coloque "fields":{"aggregate":"SUM(cost_in_real)"} e "date_start", "date_end" se souber as datas.
-
-### Importante:
-- Use "operation", "table", "fields", "where" (quando precisar).
-- NUNCA use "data" em vez de "fields".
-- Se for INSERT em "transactions", inclua "operation_type" e "patient_name".
-- Para custo, use "cost_in_real" ou "cost_in_dollar" (nunca "cost_in_usd").
+5) Se o usuário der um nome de produto informal (ex: "1drop 6000fs"), converta para "1Drop 6000mg Full Spectrum 30ml" (ou pergunte).
+6) Para SELECT, se o usuário disser "estoque atual", faça "operation":"SELECT", "table":"inventory", "where": { ... }.
+7) Se o usuário mandar algo genérico como "quanto vendemos em abril", use "operation":"SELECT", "table":"transactions", e "fields":{"aggregate":"SUM(cost_in_real)"} e datas etc.
 
 Boa sorte!
 `;
 
 // ===============================
-// 7) askGPT => agora usando histórico
+// 7) askGPT => usando histórico
 // ===============================
 async function askGPT(userNumber, userText) {
-  // 1) Carrega histórico do Redis
+  // Carrega histórico
   let history = await getConversationHistory(userNumber);
 
-  // 2) Adiciona a nova mensagem do usuário
+  // Nova msg do usuário
   history.push({ role: 'user', content: userText });
-
-  // 3) Se exceder MAX_MESSAGES, remove do início
   while (history.length > MAX_MESSAGES) {
     history.shift();
   }
 
-  // 4) Monta array final pro GPT: systemPrompt + history
+  // Monta arr final
   const messagesForGPT = [
     { role: 'system', content: systemPrompt },
     ...history
   ];
 
-  // 5) Chama GPT
-  const result = await openai.chat.completions.create({
+  // Chama GPT
+  const response = await openai.chat.completions.create({
     model: 'gpt-3.5-turbo',
     messages: messagesForGPT
   });
+  const fullAnswer = response.choices[0]?.message?.content || '';
 
-  const fullAnswer = result.choices[0]?.message?.content || '';
-
-  // 6) Armazena a resposta do bot no histórico
+  // Armazena resposta
   history.push({ role: 'assistant', content: fullAnswer });
-
-  // 7) Se exceder, remove do início
   while (history.length > MAX_MESSAGES) {
     history.shift();
   }
-
-  // 8) Salva de volta no Redis
   await saveConversationHistory(userNumber, history);
 
-  // 9) Extrai o JSON
-  let jsonPart = null;
-  const match = fullAnswer.match(/```([^`]+)```/s);
-  if (match) {
-    jsonPart = match[1].trim();
-  }
+  // Extrai JSON (com fallback)
+  const jsonPart = extractJsonBlock(fullAnswer);
 
   return { fullAnswer, jsonPart };
+}
+
+// ===============================
+// Regex fallback
+// ===============================
+function extractJsonBlock(fullAnswer) {
+  // 1) Tenta triple backticks
+  const tripleRegex = /```([\s\S]+)```/;
+  const tripleMatch = fullAnswer.match(tripleRegex);
+  if (tripleMatch) {
+    return tripleMatch[1].trim();
+  }
+
+  // 2) Tenta "json" e captura do 1o '{' até a última '}'
+  //    De forma bem agressiva (pode haver multiline).
+  //    Exemplo: "json\n{ ... }"
+  const fallbackRegex = /json[\s\S]*?(\{[\s\S]+\})/;
+  const fallbackMatch = fullAnswer.match(fallbackRegex);
+  if (fallbackMatch) {
+    return fallbackMatch[1].trim();
+  }
+
+  return null;
 }
 
 // ===============================
 // 8) handleUserMessage
 // ===============================
 async function handleUserMessage(userNumber, userText) {
-  // Chama askGPT, que já resgata e salva histórico
   const { fullAnswer, jsonPart } = await askGPT(userNumber, userText);
 
-  // Corrige JSON
-  let fixedJson = jsonPart ? fixJsonCommonIssues(jsonPart) : null;
-
   let dbMsg = 'Nenhuma operação de BD detectada.';
-  if (fixedJson) {
-    dbMsg = await executeDbOperation(fixedJson, userNumber);
+  if (jsonPart) {
+    const fixedJson = fixJsonCommonIssues(jsonPart);
+    dbMsg = await executeDbOperation(fixedJson);
   }
 
   return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
 }
 
 // ===============================
-// 9) Corrige problemas no JSON
+// 9) Corrige problemas
 // ===============================
 function fixJsonCommonIssues(jsonStr) {
   let fixed = jsonStr.replace(/"table":"stock"/gi, '"table":"inventory"');
@@ -317,7 +319,7 @@ function fixJsonCommonIssues(jsonStr) {
 // ===============================
 // 10) EXECUTA OPERAÇÃO NO BD
 // ===============================
-async function executeDbOperation(jsonStr, userNumber) {
+async function executeDbOperation(jsonStr) {
   let data;
   try {
     data = JSON.parse(jsonStr);
@@ -355,7 +357,7 @@ async function executeDbOperation(jsonStr, userNumber) {
 }
 
 // ===============================
-// 11) findClosestProductName
+// 11) Fuzzy matching
 // ===============================
 async function findClosestProductName(brand, userProductName) {
   if (!brand) return null;
@@ -378,7 +380,6 @@ async function findClosestProductName(brand, userProductName) {
   }
   return bestName;
 }
-
 function stringSimilarity(a, b) {
   const aa = a.toLowerCase();
   const bb = b.toLowerCase();
@@ -390,10 +391,8 @@ function stringSimilarity(a, b) {
 }
 
 // ===============================
-// 12) Handlers de INSERT, UPDATE, DELETE, SELECT
-// (igual ao seu código corrigido)
+// 12) Handlers
 // ===============================
-
 async function handleInsert(table, f) {
   if (table === 'patients') return insertPatient(f);
   if (table === 'transactions') return insertTransaction(f);
@@ -617,10 +616,8 @@ async function handleSelect(table, where, fields) {
 // ===============================
 // 13) Configura WA
 // ===============================
-const { Client: WabClient, LocalAuth: WabLocalAuth } = require('whatsapp-web.js');
-
-const client = new WabClient({
-  authStrategy: new WabLocalAuth(),
+const client = new Client({
+  authStrategy: new LocalAuth(),
   puppeteer: {
     headless: true,
     args: [
@@ -639,6 +636,7 @@ client.on('qr', (qr) => {
 
 client.on('ready', async () => {
   console.log('Bot conectado ao WhatsApp!');
+  // Inicia Redis e Postgres
   await initRedis();
   await initDB();
 });
