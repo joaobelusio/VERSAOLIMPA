@@ -92,12 +92,6 @@ async function initDB() {
   `);
 
   // Tabela de transações (entradas e saídas).
-  // Acrescentamos campos específicos de SAÍDA:
-  //  - sale_type (Sedex, Portaria, EnvioDireto)
-  //  - paid (boolean)
-  //  - payment_method (pix, credito, debito, dinheiro, doacao, etc.)
-  //  - date_of_sale (timestamp)
-  //  - sale_code: para agrupar itens de uma mesma venda
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -111,7 +105,7 @@ async function initDB() {
       cost_in_dollar NUMERIC,
       exchange_rate NUMERIC,
 
-      sale_type TEXT,           -- "Sedex", "Portaria", "Envio Direto" (só se SAÍDA)
+      sale_type TEXT,           -- "Sedex", "Portaria", "Envio Direto"
       paid BOOLEAN,             -- se está pago ou não
       payment_method TEXT,      -- forma de pagamento
       date_of_sale TIMESTAMP,   -- data da saída
@@ -172,41 +166,14 @@ Você é um assistente que gerencia estoque e vendas de produtos à base de CBD 
   - date_of_sale: se não informada, usar data/hora atual
   - paid: true/false
   - payment_method: "pix", "credito", "debito", "dinheiro", "doacao", etc.
-- Podem ser vários produtos numa só operação (nesse caso, gerar multiple inserts ou uma convenção de "sale_code").
+- Podem ser vários produtos numa só operação (nesse caso, gerar multiple inserts ou usar "sale_code" para agrupar).
 
 **Se faltarem dados essenciais**, você deve perguntar ao usuário se ele quer fornecer ou se prefere gravar assim mesmo.
-
-**Exemplo de JSON** (saída/venda de 3 frascos):
-\`\`\`
-{
-  "operation":"INSERT",
-  "table":"transactions",
-  "fields":{
-    "brand":"1DROP",
-    "product_name":"1Drop 6000mg Full Spectrum 30ml",
-    "quantity":3,
-    "operation_type":"SAÍDA",
-    "patient_name":"Fulano de Tal",
-    "sale_type":"Sedex",
-    "paid":true,
-    "payment_method":"pix",
-    "date_of_sale":"2025-02-19 10:30:00",
-    "cost_in_real":1950,
-    "cost_in_dollar":0,
-    "exchange_rate":5.2,
-    "sale_code":"VENDA-XYZ"
-  }
-}
-\`\`\`
-
-**Consultas**:
-- Perguntas do tipo "Quanto vendemos no mês X?" => utilize "operation":"SELECT" com alguma query que faça soma do cost_in_real etc.
-- Perguntas do tipo "quantos medicamentos X vendemos entre datas Y e Z?" => outro SELECT com WHERE e SUM ou COUNT.
 
 **Formato de resposta**:
 1) Breve frase em português
 2) Bloco de JSON \`\`\`
-3) Se faltam dados, pergunte e use "operation":"NONE" (ou algo que indique que aguarda info).
+3) Se faltam dados, pergunte e use "operation":"NONE".
 
 Boa sorte!
 `;
@@ -219,14 +186,13 @@ async function processUserMessage(userNumber, userMessage) {
     model: 'gpt-3.5-turbo',
     messages: [
       { role: 'system', content: systemPrompt },
-      // Podendo incluir parte do histórico, se desejar
       { role: 'user', content: userMessage }
     ]
   });
 
   const fullAnswer = response.choices[0]?.message?.content || '';
 
-  // Extraímos o JSON
+  // Extrair JSON de dentro de ``` ```
   const jsonRegex = /```([^`]+)```/s;
   const match = fullAnswer.match(jsonRegex);
   let jsonPart = null;
@@ -242,31 +208,23 @@ async function processUserMessage(userNumber, userMessage) {
 // e lida com a persistência no BD.
 // ------------------------------------------------------
 async function handleUserMessage(userNumber, userMsg) {
-  // Verifica se já temos uma operação pendente para este usuário
+  // Verifica se já temos algo pendente para este usuário
   const userSession = conversationState[userNumber] || {};
 
   // 1) Se temos algo pendente e o usuário está fornecendo infos:
   if (userSession.pendingOperation) {
-    // Tentar ver se o user completou os dados faltantes
-    // (exemplo simplificado: assumimos que se user manda "o método de pagamento é pix",
-    // então completamos "payment_method":"pix" e finalizamos.)
-    // Nesse exemplo, iremos só delegar novamente ao GPT. Em produção, poderia ser algo mais manual.
-
     // Combine a msg do usuário com a pendência
-    const combinedMsg = `${userSession.pendingOperation}\n\n Usuário diz agora: "${userMsg}"`;
+    const combinedMsg = `${userSession.pendingOperation}\n\nUsuário diz agora: "${userMsg}"`;
 
     const { fullAnswer, jsonPart } = await processUserMessage(userNumber, combinedMsg);
 
-    // Tenta novamente processar
     let dbMsg = '';
     if (jsonPart) {
       dbMsg = await executeDbOperation(jsonPart, userNumber);
     }
 
-    // Se ainda não resolveu, dbMsg poderia ser "faltam dados..." => Então continua pendente
-    // Caso contrário, limpamos a pendência
+    // Se não houver aviso de dados faltantes, limpamos pendência
     if (!dbMsg.includes('faltam dados') && !dbMsg.includes('aguardando')) {
-      // Consideramos resolvido
       userSession.pendingOperation = null;
     }
 
@@ -278,21 +236,18 @@ async function handleUserMessage(userNumber, userMsg) {
   // 2) Se não há pendência, chamamos GPT diretamente
   const { fullAnswer, jsonPart } = await processUserMessage(userNumber, userMsg);
 
-  // Tenta rodar a operação
   let dbResult = '';
   if (jsonPart) {
     dbResult = await executeDbOperation(jsonPart, userNumber);
-    // Se a resposta do BD indicar que faltam dados,
-    // guardamos a pendência
     if (dbResult.includes('faltam dados') || dbResult.includes('por favor forneça')) {
       // Deixamos a conversationState com a pendingOperation
       userSession.pendingOperation = userMsg;
-      conversationState[userNumber] = userSession;
     }
   } else {
     dbResult = 'Nenhuma operação de BD detectada.';
   }
 
+  conversationState[userNumber] = userSession;
   return `${fullAnswer}\n\n[DB INFO]: ${dbResult}`;
 }
 
@@ -333,16 +288,14 @@ async function executeDbOperation(jsonStr, userNumber) {
 }
 
 // ------------------------------------------------------
-// Handlers
+// Handlers de INSERT, UPDATE, DELETE, SELECT
 // ------------------------------------------------------
 async function handleInsert(table, fields) {
   switch (table) {
     case 'patients':
       return await insertPatient(fields);
-
     case 'transactions':
       return await insertTransaction(fields);
-
     default:
       return `INSERT em '${table}' não implementado.`;
   }
@@ -363,7 +316,6 @@ async function insertPatient(fields) {
   } = fields;
 
   if (!full_name) {
-    // Exemplo de pergunta
     return 'Falta o nome completo (full_name). Por favor forneça ou confirme que deseja inserir sem esse dado.';
   }
 
@@ -399,27 +351,21 @@ async function insertTransaction(fields) {
     cost_in_real,
     cost_in_dollar,
     exchange_rate,
-
-    // Novos campos para SAÍDA
-    sale_type,        // "Sedex", "Portaria", "Envio Direto"
-    paid,             // true/false
-    payment_method,   // "pix", etc.
-    date_of_sale,     // se não vier, usar now()
-    sale_code         // para agrupar itens
+    sale_type,
+    paid,
+    payment_method,
+    date_of_sale,
+    sale_code
   } = fields;
 
   if (!brand || !product_name || !quantity || !operation_type) {
     return 'Campos insuficientes para inserir transação (brand/product_name/quantity/operation_type).';
   }
-
-  // Se for ENTRADA, precisamos de patient_name (ANVISA)
-  // Se for SAÍDA, precisamos (ou não) do patient_name? Depende do seu modelo de negócio.
-  // Vamos supor que sempre precisa de "patient_name".
   if (!patient_name) {
     return 'Falta o nome do paciente (patient_name). Por favor forneça ou confirme que deseja inserir sem esse dado.';
   }
 
-  // Buscamos no BD
+  // Busca paciente
   const patRes = await pool.query(`SELECT id FROM patients WHERE full_name ILIKE $1`, [patient_name]);
   if (patRes.rows.length === 0) {
     return `Paciente '${patient_name}' não encontrado. Cadastre-o primeiro ou corrija o nome.`;
@@ -437,13 +383,11 @@ async function insertTransaction(fields) {
     if (operation_type === 'ENTRADA') {
       newQty = current + quantity;
     } else {
-      // SAÍDA
       newQty = current - quantity;
-      if (newQty < 0) newQty = 0; // ou pode falhar se não há estoque suficiente
+      if (newQty < 0) newQty = 0; 
     }
     await pool.query(`UPDATE inventory SET quantity=$1 WHERE id=$2`, [newQty, productId]);
   } else {
-    // Se não existe, criamos
     const insInv = await pool.query(`
       INSERT INTO inventory (brand, product_name, quantity)
       VALUES ($1,$2,$3) RETURNING id
@@ -469,7 +413,6 @@ async function insertTransaction(fields) {
   // Data da venda
   let finalDateSale = date_of_sale ? new Date(date_of_sale) : null;
   if (!finalDateSale || isNaN(finalDateSale.getTime())) {
-    // se for SAÍDA e não veio data, assume now
     if (operation_type === 'SAÍDA') {
       finalDateSale = new Date();
     } else {
@@ -489,7 +432,7 @@ async function insertTransaction(fields) {
     productId, operation_type, quantity,
     patientId, cReal, cDollar, fx,
     sale_type || null,
-    (paid===true || paid==="true") ? true : false,
+    (paid === true || paid === "true") ? true : false,
     payment_method || null,
     finalDateSale,
     sale_code || null
@@ -507,12 +450,12 @@ async function handleUpdate(table, fields, where) {
   const setParts = [];
   const vals = [];
   let idx = 1;
-  for (const [k,v] of Object.entries(fields)) {
+  for (const [k, v] of Object.entries(fields)) {
     setParts.push(`${k}=$${idx++}`);
     vals.push(v);
   }
   const whereParts = [];
-  for (const [k,v] of Object.entries(where)) {
+  for (const [k, v] of Object.entries(where)) {
     whereParts.push(`${k}=$${idx++}`);
     vals.push(v);
   }
@@ -537,11 +480,8 @@ async function handleDelete(table, where) {
   return `DELETE realizado em ${table} (where: ${JSON.stringify(where)})`;
 }
 
-// SELECT genérico (poderíamos melhorar para SOMA, GROUP BY, etc.)
+// SELECT genérico
 async function handleSelect(table, where, data) {
-  // Exemplo: se o GPT mandar algo como
-  // "operation":"SELECT", "table":"transactions", "fields":{"aggregate":"SUM(cost_in_real)"},"where":{...}
-  // poderíamos montar um select custom. Mas aqui é simples.
   let sql = `SELECT * FROM ${table}`;
   const vals = [];
   if (Object.keys(where).length) {
@@ -583,11 +523,19 @@ client.on('ready', async () => {
   await initDB();
 });
 
+// --- SEÇÃO IMPORTANTE: FILTRO DE NÚMEROS ---
+// Se não quiser filtrar, basta comentar estas linhas:
+const allowedNumbers = [
+  // Exemplo de formato correto (com DDI 55, DDD e número)
+  // '5551998682720@c.us',
+  // '5551999551005@c.us'
+];
+
 client.on('message', async (msg) => {
   try {
-    // Filtrar para só aceitar mensagens de certos números
-    const allowedNumbers = ['5551998682720@c.us','5551999551005@c.us'];
-    if (!allowedNumbers.includes(msg.from)) {
+    // Se a lista de allowedNumbers estiver vazia, o bot responde a todos
+    // Se estiver preenchida, só responde aos que estão nela
+    if (allowedNumbers.length > 0 && !allowedNumbers.includes(msg.from)) {
       return; // ignora
     }
 
@@ -595,9 +543,7 @@ client.on('message', async (msg) => {
     const userText = msg.body;
     console.log(`Mensagem de ${userNumber}: ${userText}`);
 
-    // Processa
     const responseText = await handleUserMessage(userNumber, userText);
-
     await msg.reply(responseText);
 
   } catch (err) {
