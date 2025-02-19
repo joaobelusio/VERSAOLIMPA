@@ -2,9 +2,9 @@ require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 
-// ------------------------------------------------------
-// HACK para simular a sintaxe antiga do "OpenAI".
-// ------------------------------------------------------
+// ===============================
+// 1) OPENAI "velha sintaxe"
+// ===============================
 const openaiModule = require('openai');
 function OldStyleOpenAIConstructor({ apiKey }) {
   const { Configuration, OpenAIApi } = openaiModule;
@@ -28,16 +28,15 @@ function OldStyleOpenAIConstructor({ apiKey }) {
 openaiModule.default = OldStyleOpenAIConstructor;
 const { default: OpenAI } = openaiModule;
 
-// Verifica se temos a chave da OpenAI
 if (!process.env.OPENAI_API_KEY) {
   console.error('ERRO: OPENAI_API_KEY não definida!');
   process.exit(1);
 }
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ------------------------------------------------------
-// Conexão ao PostgreSQL (usando pg Pool)
-// ------------------------------------------------------
+// ===============================
+// 2) POSTGRES
+// ===============================
 const { Pool } = require('pg');
 const pool = new Pool({
   host: process.env.PGHOST,
@@ -48,27 +47,37 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ------------------------------------------------------
-// Conexão ao Redis (para armazenar estado da conversa)
-// ------------------------------------------------------
+// ===============================
+// 3) REDIS (para pendências)
+// ===============================
 const redis = require('redis');
 const redisClient = redis.createClient({
-  url: process.env.REDIS_URL // ex: "redis://default:senha@host:port"
+  url: process.env.REDIS_URL // ex: "redis://default:senhadoredis@host:port"
 });
-redisClient.on('error', (err) => console.error('Redis Client Error', err));
+redisClient.on('error', (err) => console.error('Erro no Redis:', err));
 
-// Inicializa o Redis
 async function initRedis() {
   if (!redisClient.isOpen) {
     await redisClient.connect();
+    console.log('Conectado ao Redis!');
   }
 }
 
-// ------------------------------------------------------
-// Cria tabelas no PostgreSQL (se não existirem) e seeds
-// ------------------------------------------------------
+async function getPendingOperation(userNumber) {
+  return await redisClient.get(`pendingOp:${userNumber}`);
+}
+async function setPendingOperation(userNumber, value) {
+  if (value) {
+    await redisClient.set(`pendingOp:${userNumber}`, value);
+  } else {
+    await redisClient.del(`pendingOp:${userNumber}`);
+  }
+}
+
+// ===============================
+// 4) Cria tabelas + seeds
+// ===============================
 async function initDB() {
-  // Tabela de produtos oficiais
   await pool.query(`
     CREATE TABLE IF NOT EXISTS official_products (
       id SERIAL PRIMARY KEY,
@@ -76,8 +85,6 @@ async function initDB() {
       canonical_name TEXT NOT NULL
     );
   `);
-
-  // Tabela de pacientes
   await pool.query(`
     CREATE TABLE IF NOT EXISTS patients (
       id SERIAL PRIMARY KEY,
@@ -92,8 +99,6 @@ async function initDB() {
       data_expiracao DATE
     );
   `);
-
-  // Tabela de estoque
   await pool.query(`
     CREATE TABLE IF NOT EXISTS inventory (
       id SERIAL PRIMARY KEY,
@@ -102,8 +107,6 @@ async function initDB() {
       quantity INTEGER NOT NULL DEFAULT 0
     );
   `);
-
-  // Tabela de transações
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -117,7 +120,7 @@ async function initDB() {
       cost_in_dollar NUMERIC,
       exchange_rate NUMERIC,
 
-      sale_type TEXT,    -- "Sedex", "Portaria", etc.
+      sale_type TEXT,
       paid BOOLEAN,
       payment_method TEXT,
       date_of_sale TIMESTAMP,
@@ -127,14 +130,14 @@ async function initDB() {
 
   console.log('Tabelas criadas/atualizadas se não existiam.');
 
-  // Seeds de 'official_products'
+  // Seeds
   const seedProducts = [
     ['1DROP', '1Drop 1500mg Full Spectrum 30ml'],
     ['1DROP', '1Drop 2100mg (1500mg Full Spectrum + 300mg CBG + 300mg D8-THC) 30ml'],
     ['1DROP', '1Drop 2250mg BroadSpectrum (1500mg Full Spectrum + 750mg CBG) com zero THC 30ml'],
     ['1DROP', '1Drop 6000mg CBD Isolado 30ml'],
     ['1DROP', '1Drop 6000mg Full Spectrum 30ml'],
-    ['1DROP', '1Drop Gummies 900mg/30 unidades por frasco 10:1:1 (750mg de CBD + 75mg de D9-THC + 75mg de CBG por frasco) Full Spectrum Zero Açúcar'],
+    ['1DROP', '1Drop Gummies 900mg/30 unidades por frasco 10:1:1 (750mg de CBD + 75mg de D9-THC + 75mg de CBG) Full Spectrum Zero Açúcar'],
     ['KannabidiOil', 'KannabidiOil 1800mg (1500mg Full Spectrum +300mg CBN + Melatonina) 30ml'],
     ['KannabidiOil', 'KannabidiOil 1800mg (1500mg Full Spectrum e +300mg D8-THC) + Vitamina D 30ml'],
     ['KannabidiOil', 'KannabidiOil Gummies BLISS+ 1050mg/30un (25mg de CBD, 5mg de D9-THC e 5mg de CBG por bala)'],
@@ -156,190 +159,239 @@ async function initDB() {
   console.log('Seeds de official_products inseridos (se faltava).');
 }
 
-// ------------------------------------------------------
-// "Melhoramos a inteligência" adicionando instruções
-// ao systemPrompt para lidar com soma, contagens,
-// e intervalos de datas (se o GPT mandar).
-// ------------------------------------------------------
+// ===============================
+// 5) System Prompt "forte"
+// ===============================
+// Este prompt é bem específico, com exemplos, para "educar" o GPT.
 const systemPrompt = `
-Você é um assistente que gerencia estoque e vendas de produtos à base de CBD (com dados no PostgreSQL).
+Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados **PostgreSQL**.
 
-**Marcas válidas**: 1DROP, KannabidiOil, LIBERI, VITA10.
+### Tabelas válidas:
+- "patients"
+- "inventory"
+- "transactions"
+- "official_products"
 
-**Formas de Operação**:
-- ENTRADA (compra/importação) associada a paciente ANVISA
-- SAÍDA (venda para paciente/cliente), com:
-  - sale_type: "Sedex", "Portaria" ou "Envio Direto"
-  - date_of_sale: se não informada, usar data/hora atual
-  - paid: true/false
-  - payment_method: "pix", "credito", "debito", "dinheiro", "doacao", etc.
+(NUNCA use "stock", "table":"stock" ou outra variação que não esteja na lista acima.)
 
-**Se faltarem dados essenciais**, peça ao usuário.
+### Campos obrigatórios para "transactions" (INSERT):
+- "brand": string
+- "product_name": string (ex: "1Drop 6000mg Full Spectrum 30ml")
+- "quantity": número
+- "operation_type": "ENTRADA" ou "SAÍDA"
+- "patient_name": string
+- "cost_in_real" ou "cost_in_dollar" (pode ser 0 se não tiver)
+- "exchange_rate" (pode ser 5.0 se não tiver outro valor)
 
-**Formato de resposta**:
-1) Breve frase em português explicando o que fará.
-2) Bloco de JSON \`\`\`
-3) Se faltam dados, "operation":"NONE".
-
-**Consultas extras**:
-- Para saber o total em Real, use "SELECT" com "aggregate":"SUM(cost_in_real)" ou "SUM(quantity)".
-- Para filtrar por datas, inclua "date_start" e "date_end" em fields ou where.
-
-Exemplo:
+### Exemplo de JSON correto para SAÍDA:
 \`\`\`
 {
-  "operation":"SELECT",
+  "operation":"INSERT",
   "table":"transactions",
   "fields":{
-    "aggregate":"SUM(cost_in_real)",
-    "date_start":"2025-01-01",
-    "date_end":"2025-01-31"
-  },
-  "where":{
-    "operation_type":"SAÍDA"
+    "brand":"1DROP",
+    "product_name":"1Drop 6000mg Full Spectrum 30ml",
+    "quantity":2,
+    "operation_type":"SAÍDA",
+    "patient_name":"Fulano de Tal",
+    "sale_type":"Portaria",
+    "paid":true,
+    "payment_method":"pix",
+    "date_of_sale":"2025-03-01 10:00:00",
+    "cost_in_real":2000,
+    "cost_in_dollar":0,
+    "exchange_rate":5.2
   }
 }
 \`\`\`
+
+### Regras:
+1) Sempre responda com uma frase explicando o que entendeu/fará + um bloco de JSON (entre 3 crases).
+2) Se faltarem dados, peça ao usuário e use "operation":"NONE".
+3) Se o usuário falar "dar alta de X frascos" ou "quero vender Y frascos", isso significa "operation_type":"SAÍDA".
+4) Se falar "comprei" ou "entrada", é "operation_type":"ENTRADA".
+5) Se o usuário der um nome de produto informal (ex: "1drop 6000fs"), você deve converter para o canonical_name mais próximo (ex: "1Drop 6000mg Full Spectrum 30ml"). 
+   Se não tiver 100% de certeza, pergunte.
+6) Para SELECT, se o usuário disser "estoque atual", faça "operation":"SELECT", "table":"inventory", "where": { "brand":"...", "product_name":"..." }.
+7) Se o usuário mandar algo genérico como "quanto vendemos em abril", use "operation":"SELECT", "table":"transactions", e coloque "fields":{"aggregate":"SUM(cost_in_real)"} e "date_start", "date_end" se souber as datas.
+
+### Importante:
+- Siga **exatamente** a estrutura: "operation", "table", "fields", e "where" (quando precisar).
+- NUNCA use "data" em vez de "fields".
+- Se for INSERT em "transactions", inclua "operation_type" e "patient_name".
+- Para custo, use "cost_in_real" ou "cost_in_dollar" (nunca "cost_in_usd").
+
+Boa sorte!
 `;
 
-// ------------------------------------------------------
-// Resgata do Redis a pendingOperation (se existir)
-// ------------------------------------------------------
-async function getPendingOperation(userNumber) {
-  const key = `pendingOp:${userNumber}`;
-  return await redisClient.get(key); // retorna string ou null
-}
-
-// ------------------------------------------------------
-// Seta no Redis a pendingOperation
-// ------------------------------------------------------
-async function setPendingOperation(userNumber, operationText) {
-  const key = `pendingOp:${userNumber}`;
-  if (!operationText) {
-    // limpar
-    await redisClient.del(key);
-  } else {
-    // salvar
-    await redisClient.set(key, operationText);
-  }
-}
-
-// ------------------------------------------------------
-// Função que chama ChatGPT e extrai JSON
-// ------------------------------------------------------
-async function processUserMessage(userNumber, userMessage) {
-  const response = await openai.chat.completions.create({
+// ===============================
+// 6) Chama GPT e extrai JSON
+// ===============================
+async function askGPT(userText) {
+  const result = await openai.chat.completions.create({
     model: 'gpt-3.5-turbo',
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userMessage }
+      { role: 'user', content: userText }
     ]
   });
 
-  const fullAnswer = response.choices[0]?.message?.content || '';
-
-  // Extrair JSON de dentro de ``` ```
-  const jsonRegex = /```([^`]+)```/s;
-  const match = fullAnswer.match(jsonRegex);
+  const answer = result.choices[0]?.message?.content || '';
+  // Extrair JSON do bloco ``` ```
+  const match = answer.match(/```([^`]+)```/s);
   let jsonPart = null;
   if (match) {
     jsonPart = match[1].trim();
   }
-
-  return { fullAnswer, jsonPart };
+  return { answer, jsonPart };
 }
 
-// ------------------------------------------------------
-// Principal: Decide se há pendências, chama GPT, etc.
-// ------------------------------------------------------
-async function handleUserMessage(userNumber, userMsg) {
-  // 1) Verifica se há algo pendente
-  let pending = await getPendingOperation(userNumber);
+// ===============================
+// 7) Lógica principal: pendências, GPT, etc.
+// ===============================
+async function handleUserMessage(userNumber, userText) {
+  // Verifica se há pendência
+  const pending = await getPendingOperation(userNumber);
+  let finalPrompt = userText;
 
   if (pending) {
-    // Combina pendência + msg do user
-    const combinedMsg = `${pending}\n\nUsuário diz agora: "${userMsg}"`;
-
-    const { fullAnswer, jsonPart } = await processUserMessage(userNumber, combinedMsg);
-    let dbMsg = '';
-    if (jsonPart) {
-      dbMsg = await executeDbOperation(jsonPart, userNumber);
-    }
-
-    // Se não tem mais dados pendentes
-    if (!dbMsg.includes('faltam dados') && !dbMsg.includes('aguardando')) {
-      await setPendingOperation(userNumber, null); // limpa pendência
-    }
-
-    return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
+    // Se existe pendência, combinamos
+    finalPrompt = `${pending}\n\nUsuário diz agora: "${userText}"`;
+    // Limpamos a pendência a princípio
+    await setPendingOperation(userNumber, null);
   }
 
-  // 2) Se não há pendência, chama GPT diretamente
-  const { fullAnswer, jsonPart } = await processUserMessage(userNumber, userMsg);
-  let dbResult = 'Nenhuma operação de BD detectada.';
+  // Chama GPT
+  const { answer, jsonPart } = await askGPT(finalPrompt);
 
-  if (jsonPart) {
-    dbResult = await executeDbOperation(jsonPart, userNumber);
+  // Pré-processa o JSON (corrige problemas comuns)
+  let fixedJson = jsonPart ? fixJsonCommonIssues(jsonPart) : null;
 
-    // Se ainda faltar dados, mantemos a pendência
-    if (dbResult.includes('faltam dados') || dbResult.includes('por favor forneça')) {
-      await setPendingOperation(userNumber, userMsg); 
+  // Executa no BD
+  let dbMsg = 'Nenhuma operação de BD detectada.';
+  if (fixedJson) {
+    dbMsg = await executeDbOperation(fixedJson, userNumber);
+    if (dbMsg.includes('faltam dados') || dbMsg.includes('por favor forneça')) {
+      // Re-gravamos a pendência
+      await setPendingOperation(userNumber, userText);
     }
   }
 
-  return `${fullAnswer}\n\n[DB INFO]: ${dbResult}`;
+  return `${answer}\n\n[DB INFO]: ${dbMsg}`;
 }
 
-// ------------------------------------------------------
-// EXECUTA OPERAÇÕES NO BD (com algumas melhorias)
-// ------------------------------------------------------
+// ===============================
+// 8) Corrige problemas comuns no JSON gerado
+// ===============================
+function fixJsonCommonIssues(jsonStr) {
+  // 1) Corrigir se o GPT usou "table":"stock" -> "table":"inventory"
+  let fixed = jsonStr.replace(/"table":"stock"/gi, '"table":"inventory"');
+
+  // 2) Corrigir se escreveu "cost_in_usd" em vez de "cost_in_dollar"
+  fixed = fixed.replace(/cost_in_usd/gi, 'cost_in_dollar');
+
+  // 3) Tenta forçar aspas duplas nos JSON (se GPT trocou algo)
+  // (Opcional, mas em tese o GPT já manda JSON válido)
+
+  return fixed;
+}
+
+// ===============================
+// 9) EXECUTA OPERAÇÃO NO BD
+// ===============================
 async function executeDbOperation(jsonStr, userNumber) {
-  if (!jsonStr) return 'Nenhuma operação de BD detectada.';
   let data;
   try {
     data = JSON.parse(jsonStr);
   } catch (err) {
+    console.error('ERRO parse JSON:', err, jsonStr);
     return 'JSON inválido ou erro ao fazer parse.';
   }
 
   const { operation, table, fields = {}, where = {} } = data;
   if (!operation || operation === 'NONE') {
-    return 'O GPT decidiu que não há nada para fazer no BD (ou aguarda dados).';
+    return 'O GPT decidiu que não há nada para fazer (ou aguarda dados).';
+  }
+
+  // "Fuzzy matching" do product_name, se for Insert em transactions
+  if (operation === 'INSERT' && table === 'transactions' && fields.product_name) {
+    const bestName = await findClosestProductName(fields.brand, fields.product_name);
+    if (bestName && bestName !== fields.product_name) {
+      console.log(`Corrigindo product_name de "${fields.product_name}" para "${bestName}".`);
+      fields.product_name = bestName;
+    }
   }
 
   switch (operation) {
     case 'INSERT':
       return await handleInsert(table, fields);
-
     case 'UPDATE':
       return await handleUpdate(table, fields, where);
-
     case 'DELETE':
       return await handleDelete(table, where);
-
     case 'SELECT':
-      // Aqui adicionamos lógica extra para SUM, COUNT, date ranges etc.
       return await handleSelect(table, where, fields);
-
     default:
-      return `Operação '${operation}' não reconhecida ou não implementada.`;
+      return `Operação '${operation}' não reconhecida.`;
   }
 }
 
-// ------------------------------------------------------
-// Handlers de INSERT / UPDATE / DELETE / SELECT
-// ------------------------------------------------------
+// ===============================
+// 10) Fuzzy matching do product_name
+// ===============================
+async function findClosestProductName(brand, userProductName) {
+  if (!brand) return null;
+  // Pega lista oficial
+  const res = await pool.query(`
+    SELECT canonical_name
+    FROM official_products
+    WHERE brand ILIKE $1
+  `, [brand]);
 
-// 1) INSERT
-async function handleInsert(table, fields) {
-  switch (table) {
-    case 'patients':
-      return await insertPatient(fields);
-    case 'transactions':
-      return await insertTransaction(fields);
-    default:
-      return `INSERT em '${table}' não implementado.`;
+  if (res.rows.length === 0) {
+    return null; // Nenhum found
   }
+
+  // Faz correspondência simples: 
+  // calculamos "similaridade" e pegamos a maior
+  let bestScore = -1;
+  let bestName = null;
+  for (const row of res.rows) {
+    const score = stringSimilarity(row.canonical_name, userProductName);
+    if (score > bestScore) {
+      bestScore = score;
+      bestName = row.canonical_name;
+    }
+  }
+
+  // Se a similaridade estiver muito baixa, poderia retornar null
+  // mas aqui retornamos mesmo assim
+  return bestName;
+}
+
+// EXEMPLO bem simples de "similaridade"
+function stringSimilarity(a, b) {
+  // lower
+  const aa = a.toLowerCase();
+  const bb = b.toLowerCase();
+  // conta quantos caracteres em comum
+  let matches = 0;
+  for (let ch of bb) {
+    if (aa.includes(ch)) matches++;
+  }
+  // normaliza
+  return matches / aa.length;
+}
+
+// ===============================
+// 11) Handlers
+// ===============================
+
+// INSERT
+async function handleInsert(table, f) {
+  if (table === 'patients') return insertPatient(f);
+  if (table === 'transactions') return insertTransaction(f);
+  return `INSERT em '${table}' não implementado.`;
 }
 
 async function insertPatient(fields) {
@@ -354,17 +406,15 @@ async function insertPatient(fields) {
     data_anvisa,
     data_expiracao
   } = fields;
-
   if (!full_name) {
-    return 'Falta o nome completo (full_name). Por favor forneça ou confirme que deseja inserir sem esse dado.';
+    return 'Falta "full_name". Por favor forneça.';
   }
 
-  const insertRes = await pool.query(`
-    INSERT INTO patients (
+  const res = await pool.query(`
+    INSERT INTO patients(
       full_name, email, user_gov, password_gov, medico,
       endereco, prescricao, data_anvisa, data_expiracao
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
     RETURNING id
   `, [
     full_name || null,
@@ -377,8 +427,7 @@ async function insertPatient(fields) {
     data_anvisa || null,
     data_expiracao || null
   ]);
-
-  return `Paciente inserido com ID=${insertRes.rows[0].id}.`;
+  return `Paciente inserido com ID=${res.rows[0].id}.`;
 }
 
 async function insertTransaction(fields) {
@@ -398,56 +447,51 @@ async function insertTransaction(fields) {
     sale_code
   } = fields;
 
-  if (!brand || !product_name || !quantity || !operation_type) {
-    return 'Campos insuficientes para inserir transação (brand/product_name/quantity/operation_type).';
-  }
-  if (!patient_name) {
-    return 'Falta o nome do paciente (patient_name). Por favor forneça ou confirme que deseja inserir sem esse dado.';
+  if (!brand || !product_name || !quantity || !operation_type || !patient_name) {
+    return 'Campos obrigatórios faltando (brand, product_name, quantity, operation_type, patient_name).';
   }
 
-  // Busca paciente
-  const patRes = await pool.query(`SELECT id FROM patients WHERE full_name ILIKE $1`, [patient_name]);
-  if (patRes.rows.length === 0) {
-    return `Paciente '${patient_name}' não encontrado. Cadastre-o primeiro ou corrija o nome.`;
+  // Busca o paciente
+  const pat = await pool.query(`SELECT id FROM patients WHERE full_name ILIKE $1`, [patient_name]);
+  if (pat.rows.length === 0) {
+    return `Paciente '${patient_name}' não encontrado. Cadastre primeiro ou corrija.`;
   }
-  const patientId = patRes.rows[0].id;
+  const patientId = pat.rows[0].id;
 
-  // Verifica se já existe no inventory
-  const invRes = await pool.query(`
+  // Verifica/inserir inventory
+  const inv = await pool.query(`
     SELECT id, quantity FROM inventory
     WHERE brand=$1 AND product_name=$2
   `, [brand, product_name]);
 
   let productId;
   let newQty;
-  if (invRes.rows.length > 0) {
-    productId = invRes.rows[0].id;
-    const currentQ = invRes.rows[0].quantity || 0;
+  if (inv.rows.length > 0) {
+    productId = inv.rows[0].id;
+    const current = inv.rows[0].quantity || 0;
     if (operation_type === 'ENTRADA') {
-      newQty = currentQ + quantity;
+      newQty = current + quantity;
     } else {
-      newQty = currentQ - quantity;
-      if (newQty < 0) {
-        newQty = 0; // ou poderia barrar se quiser
-      }
+      newQty = current - quantity;
+      if (newQty < 0) newQty = 0;
     }
     await pool.query(`UPDATE inventory SET quantity=$1 WHERE id=$2`, [newQty, productId]);
   } else {
-    // Se não existe, criar
-    const invInsert = await pool.query(`
+    // se não existe, cria
+    const ins = await pool.query(`
       INSERT INTO inventory (brand, product_name, quantity)
       VALUES ($1,$2,$3) RETURNING id
     `, [
       brand,
       product_name,
-      (operation_type === 'ENTRADA') ? quantity : 0
+      operation_type === 'ENTRADA' ? quantity : 0
     ]);
-    productId = invInsert.rows[0].id;
+    productId = ins.rows[0].id;
     newQty = quantity;
   }
 
-  // Calcular custos
-  const fx = exchange_rate ? Number(exchange_rate) : 5.0;
+  // custo
+  let fx = exchange_rate ? Number(exchange_rate) : 5.0;
   let cReal = cost_in_real ? Number(cost_in_real) : 0;
   let cDollar = cost_in_dollar ? Number(cost_in_dollar) : 0;
   if (cReal === 0 && cDollar > 0) {
@@ -456,97 +500,87 @@ async function insertTransaction(fields) {
     cDollar = cReal / fx;
   }
 
-  // Data da venda
-  let finalDateSale = date_of_sale ? new Date(date_of_sale) : null;
-  if (!finalDateSale || isNaN(finalDateSale.getTime())) {
+  // data
+  let finalDate = date_of_sale ? new Date(date_of_sale) : null;
+  if (!finalDate || isNaN(finalDate.getTime())) {
     if (operation_type === 'SAÍDA') {
-      finalDateSale = new Date();
+      finalDate = new Date();
     } else {
-      finalDateSale = null;
+      finalDate = null;
     }
   }
 
-  const transRes = await pool.query(`
-    INSERT INTO transactions (
+  const tr = await pool.query(`
+    INSERT INTO transactions(
       product_id, operation_type, quantity,
       patient_id, cost_in_real, cost_in_dollar, exchange_rate,
       sale_type, paid, payment_method, date_of_sale, sale_code
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     RETURNING id
   `, [
     productId, operation_type, quantity,
     patientId, cReal, cDollar, fx,
-    sale_type || null,
+    sale_type||null,
     (paid === true || paid === "true") ? true : false,
-    payment_method || null,
-    finalDateSale,
-    sale_code || null
+    payment_method||null,
+    finalDate,
+    sale_code||null
   ]);
 
-  const tid = transRes.rows[0].id;
-  return `Transação ID=${tid} inserida. Estoque de ${brand} / ${product_name} agora é ${newQty}.`;
+  return `Transação inserida (ID=${tr.rows[0].id}). Estoque de "${brand} / ${product_name}" agora é ${newQty}.`;
 }
 
-// 2) UPDATE
+// UPDATE
 async function handleUpdate(table, fields, where) {
   if (!Object.keys(where).length) {
-    return 'WHERE não informado para UPDATE.';
+    return 'WHERE não informado.';
   }
-
   const setParts = [];
   const vals = [];
   let idx = 1;
-  for (const [k, v] of Object.entries(fields)) {
+  for (const [k,v] of Object.entries(fields)) {
     setParts.push(`${k}=$${idx++}`);
     vals.push(v);
   }
   const whereParts = [];
-  for (const [k, v] of Object.entries(where)) {
+  for (const [k,v] of Object.entries(where)) {
     whereParts.push(`${k}=$${idx++}`);
     vals.push(v);
   }
   const sql = `UPDATE ${table} SET ${setParts.join(', ')} WHERE ${whereParts.join(' AND ')}`;
-
   await pool.query(sql, vals);
   return `Registro(s) atualizado(s) em ${table}.`;
 }
 
-// 3) DELETE
+// DELETE
 async function handleDelete(table, where) {
   if (!Object.keys(where).length) {
-    return 'WHERE não informado para DELETE.';
+    return 'WHERE não informado.';
   }
-
   const clauses = [];
   const vals = [];
   Object.entries(where).forEach(([k,v], i) => {
     clauses.push(`${k}=$${i+1}`);
     vals.push(v);
   });
-  const sqlDel = `DELETE FROM ${table} WHERE ${clauses.join(' AND ')}`;
-  await pool.query(sqlDel, vals);
-
+  const sql = `DELETE FROM ${table} WHERE ${clauses.join(' AND ')}`;
+  await pool.query(sql, vals);
   return `DELETE realizado em ${table} (where: ${JSON.stringify(where)})`;
 }
 
-// 4) SELECT (com possíveis agregados e intervalos de datas)
+// SELECT
 async function handleSelect(table, where, fields) {
-  // "fields.aggregate" pode ser algo como "SUM(cost_in_real)" ou "COUNT(*)"
-  // "fields.date_start" e "fields.date_end" podem existir para filtrar datas
+  // fields pode ter "aggregate", "date_start", "date_end"
   const { aggregate, date_start, date_end } = fields;
-
-  // Monta SELECT
-  let selectClause = '*';
+  let sel = '*';
   if (aggregate) {
-    selectClause = `${aggregate} as result`; 
+    sel = `${aggregate} as result`;
   }
-
-  let sql = `SELECT ${selectClause} FROM ${table}`;
+  let sql = `SELECT ${sel} FROM ${table}`;
   const vals = [];
   const clauses = [];
 
-  // Se for transactions, e tiver date_start ou date_end, filtramos date_of_sale
+  // Se for transactions e tiver date_start / date_end
   if (table === 'transactions') {
     if (date_start) {
       clauses.push(`date_of_sale >= $${vals.length+1}`);
@@ -558,12 +592,11 @@ async function handleSelect(table, where, fields) {
     }
   }
 
-  // Filtros do "where"
-  Object.entries(where).forEach(([k,v]) => {
-    // Ex: { operation_type: "SAÍDA" }
+  // where
+  for (const [k,v] of Object.entries(where)) {
     clauses.push(`${k}=$${vals.length+1}`);
     vals.push(v);
-  });
+  }
 
   if (clauses.length > 0) {
     sql += ` WHERE ` + clauses.join(' AND ');
@@ -571,25 +604,22 @@ async function handleSelect(table, where, fields) {
 
   const res = await pool.query(sql, vals);
 
-  // Se foi um aggregate, retornamos o valor
   if (aggregate) {
-    if (res.rows.length === 0 || res.rows[0].result === null) {
-      return `Resultado do agregado = 0 ou sem linhas.`;
+    if (res.rows.length > 0 && res.rows[0].result != null) {
+      return `Resultado do ${aggregate}: ${res.rows[0].result}`;
+    } else {
+      return `Resultado do ${aggregate}: 0 (ou nada encontrado)`;
     }
-    return `Resultado da agregação: ${res.rows[0].result}`;
   }
-
-  // Se não for agregação
-  if (!res.rows.length) {
+  if (res.rows.length === 0) {
     return 'Nenhum resultado encontrado.';
   }
-  // Retorna JSON
   return JSON.stringify(res.rows, null, 2);
 }
 
-// ------------------------------------------------------
-// Configura o cliente WhatsApp
-// ------------------------------------------------------
+// ===============================
+// 12) Configura WA
+// ===============================
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
@@ -604,36 +634,34 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => {
-  console.log('QR Code gerado, aponte a câmera do WhatsApp para autenticar:');
+  console.log('QR Code gerado, aponte a câmera do WhatsApp:');
   qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', async () => {
-  console.log('Bot conectado com sucesso!');
+  console.log('Bot conectado ao WhatsApp!');
   await initRedis();
   await initDB();
 });
 
 const allowedNumbers = [
-  // Se quiser restringir, insira no formato ex: '555199999999@c.us'
+  // Ex: '555199999999@c.us'
 ];
 
 client.on('message', async (msg) => {
   try {
-    // Filtrar por allowedNumbers
     if (allowedNumbers.length > 0 && !allowedNumbers.includes(msg.from)) {
-      return;
+      return; // ignora
     }
-
     const userNumber = msg.from;
     const userText = msg.body;
-    console.log(`Mensagem de ${userNumber}: ${userText}`);
+    console.log(`[MSG de ${userNumber}]: ${userText}`);
 
     const responseText = await handleUserMessage(userNumber, userText);
     await msg.reply(responseText);
 
   } catch (err) {
-    console.error('Erro ao processar mensagem:', err);
+    console.error('Erro ao processar msg:', err);
     await msg.reply('Desculpe, ocorreu um erro ao processar sua solicitação.');
   }
 });
