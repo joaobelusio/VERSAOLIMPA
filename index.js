@@ -28,9 +28,7 @@ function OldStyleOpenAIConstructor({ apiKey }) {
 openaiModule.default = OldStyleOpenAIConstructor;
 const { default: OpenAI } = openaiModule;
 
-// ------------------------------------------------------
-// Inicializa a "OpenAI" com sintaxe antiga
-// ------------------------------------------------------
+// Verifica se temos a chave da OpenAI
 if (!process.env.OPENAI_API_KEY) {
   console.error('ERRO: OPENAI_API_KEY não definida!');
   process.exit(1);
@@ -41,7 +39,6 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Conexão ao PostgreSQL (usando pg Pool)
 // ------------------------------------------------------
 const { Pool } = require('pg');
-
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -52,10 +49,25 @@ const pool = new Pool({
 });
 
 // ------------------------------------------------------
-// Tabelas e inicialização
+// Conexão ao Redis (para armazenar estado da conversa)
+// ------------------------------------------------------
+const redis = require('redis');
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL // ex: "redis://default:senha@host:port"
+});
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+
+// Inicializa o Redis
+async function initRedis() {
+  if (!redisClient.isOpen) {
+    await redisClient.connect();
+  }
+}
+
+// ------------------------------------------------------
+// Cria tabelas no PostgreSQL (se não existirem) e seeds
 // ------------------------------------------------------
 async function initDB() {
-
   // Tabela de produtos oficiais
   await pool.query(`
     CREATE TABLE IF NOT EXISTS official_products (
@@ -91,7 +103,7 @@ async function initDB() {
     );
   `);
 
-  // Tabela de transações (entradas e saídas).
+  // Tabela de transações
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -100,22 +112,22 @@ async function initDB() {
       quantity INTEGER NOT NULL,
       created_at TIMESTAMP DEFAULT NOW(),
 
-      patient_id INTEGER REFERENCES patients(id),  -- Paciente ANVISA ou comprador
+      patient_id INTEGER REFERENCES patients(id),
       cost_in_real NUMERIC,
       cost_in_dollar NUMERIC,
       exchange_rate NUMERIC,
 
-      sale_type TEXT,           -- "Sedex", "Portaria", "Envio Direto"
-      paid BOOLEAN,             -- se está pago ou não
-      payment_method TEXT,      -- forma de pagamento
-      date_of_sale TIMESTAMP,   -- data da saída
-      sale_code TEXT            -- código pra agrupar múltiplos itens
+      sale_type TEXT,    -- "Sedex", "Portaria", etc.
+      paid BOOLEAN,
+      payment_method TEXT,
+      date_of_sale TIMESTAMP,
+      sale_code TEXT
     );
   `);
 
   console.log('Tabelas criadas/atualizadas se não existiam.');
 
-  // Inserção de produtos oficiais (seed)
+  // Seeds de 'official_products'
   const seedProducts = [
     ['1DROP', '1Drop 1500mg Full Spectrum 30ml'],
     ['1DROP', '1Drop 2100mg (1500mg Full Spectrum + 300mg CBG + 300mg D8-THC) 30ml'],
@@ -145,14 +157,9 @@ async function initDB() {
 }
 
 // ------------------------------------------------------
-// Memória de Conversa simples em RAM
-// (em produção, poderia ser Redis, DB, etc.)
-// ------------------------------------------------------
-const conversationState = {}; 
-// Estrutura: conversationState[waNumber] = { pendingOperation: {...}, ... }
-
-// ------------------------------------------------------
-// Prompt do GPT
+// "Melhoramos a inteligência" adicionando instruções
+// ao systemPrompt para lidar com soma, contagens,
+// e intervalos de datas (se o GPT mandar).
 // ------------------------------------------------------
 const systemPrompt = `
 Você é um assistente que gerencia estoque e vendas de produtos à base de CBD (com dados no PostgreSQL).
@@ -166,17 +173,56 @@ Você é um assistente que gerencia estoque e vendas de produtos à base de CBD 
   - date_of_sale: se não informada, usar data/hora atual
   - paid: true/false
   - payment_method: "pix", "credito", "debito", "dinheiro", "doacao", etc.
-- Podem ser vários produtos numa só operação (nesse caso, gerar multiple inserts ou usar "sale_code" para agrupar).
 
-**Se faltarem dados essenciais**, você deve perguntar ao usuário se ele quer fornecer ou se prefere gravar assim mesmo.
+**Se faltarem dados essenciais**, peça ao usuário.
 
 **Formato de resposta**:
-1) Breve frase em português
+1) Breve frase em português explicando o que fará.
 2) Bloco de JSON \`\`\`
-3) Se faltam dados, pergunte e use "operation":"NONE".
+3) Se faltam dados, "operation":"NONE".
 
-Boa sorte!
+**Consultas extras**:
+- Para saber o total em Real, use "SELECT" com "aggregate":"SUM(cost_in_real)" ou "SUM(quantity)".
+- Para filtrar por datas, inclua "date_start" e "date_end" em fields ou where.
+
+Exemplo:
+\`\`\`
+{
+  "operation":"SELECT",
+  "table":"transactions",
+  "fields":{
+    "aggregate":"SUM(cost_in_real)",
+    "date_start":"2025-01-01",
+    "date_end":"2025-01-31"
+  },
+  "where":{
+    "operation_type":"SAÍDA"
+  }
+}
+\`\`\`
 `;
+
+// ------------------------------------------------------
+// Resgata do Redis a pendingOperation (se existir)
+// ------------------------------------------------------
+async function getPendingOperation(userNumber) {
+  const key = `pendingOp:${userNumber}`;
+  return await redisClient.get(key); // retorna string ou null
+}
+
+// ------------------------------------------------------
+// Seta no Redis a pendingOperation
+// ------------------------------------------------------
+async function setPendingOperation(userNumber, operationText) {
+  const key = `pendingOp:${userNumber}`;
+  if (!operationText) {
+    // limpar
+    await redisClient.del(key);
+  } else {
+    // salvar
+    await redisClient.set(key, operationText);
+  }
+}
 
 // ------------------------------------------------------
 // Função que chama ChatGPT e extrai JSON
@@ -204,59 +250,51 @@ async function processUserMessage(userNumber, userMessage) {
 }
 
 // ------------------------------------------------------
-// Função principal que decide se há pendências
-// e lida com a persistência no BD.
+// Principal: Decide se há pendências, chama GPT, etc.
 // ------------------------------------------------------
 async function handleUserMessage(userNumber, userMsg) {
-  // Verifica se já temos algo pendente para este usuário
-  const userSession = conversationState[userNumber] || {};
+  // 1) Verifica se há algo pendente
+  let pending = await getPendingOperation(userNumber);
 
-  // 1) Se temos algo pendente e o usuário está fornecendo infos:
-  if (userSession.pendingOperation) {
-    // Combine a msg do usuário com a pendência
-    const combinedMsg = `${userSession.pendingOperation}\n\nUsuário diz agora: "${userMsg}"`;
+  if (pending) {
+    // Combina pendência + msg do user
+    const combinedMsg = `${pending}\n\nUsuário diz agora: "${userMsg}"`;
 
     const { fullAnswer, jsonPart } = await processUserMessage(userNumber, combinedMsg);
-
     let dbMsg = '';
     if (jsonPart) {
       dbMsg = await executeDbOperation(jsonPart, userNumber);
     }
 
-    // Se não houver aviso de dados faltantes, limpamos pendência
+    // Se não tem mais dados pendentes
     if (!dbMsg.includes('faltam dados') && !dbMsg.includes('aguardando')) {
-      userSession.pendingOperation = null;
+      await setPendingOperation(userNumber, null); // limpa pendência
     }
-
-    conversationState[userNumber] = userSession;
 
     return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
   }
 
-  // 2) Se não há pendência, chamamos GPT diretamente
+  // 2) Se não há pendência, chama GPT diretamente
   const { fullAnswer, jsonPart } = await processUserMessage(userNumber, userMsg);
+  let dbResult = 'Nenhuma operação de BD detectada.';
 
-  let dbResult = '';
   if (jsonPart) {
     dbResult = await executeDbOperation(jsonPart, userNumber);
+
+    // Se ainda faltar dados, mantemos a pendência
     if (dbResult.includes('faltam dados') || dbResult.includes('por favor forneça')) {
-      // Deixamos a conversationState com a pendingOperation
-      userSession.pendingOperation = userMsg;
+      await setPendingOperation(userNumber, userMsg); 
     }
-  } else {
-    dbResult = 'Nenhuma operação de BD detectada.';
   }
 
-  conversationState[userNumber] = userSession;
   return `${fullAnswer}\n\n[DB INFO]: ${dbResult}`;
 }
 
 // ------------------------------------------------------
-// EXECUTA OPERAÇÕES NO BD
+// EXECUTA OPERAÇÕES NO BD (com algumas melhorias)
 // ------------------------------------------------------
 async function executeDbOperation(jsonStr, userNumber) {
   if (!jsonStr) return 'Nenhuma operação de BD detectada.';
-
   let data;
   try {
     data = JSON.parse(jsonStr);
@@ -280,7 +318,8 @@ async function executeDbOperation(jsonStr, userNumber) {
       return await handleDelete(table, where);
 
     case 'SELECT':
-      return await handleSelect(table, where, data);
+      // Aqui adicionamos lógica extra para SUM, COUNT, date ranges etc.
+      return await handleSelect(table, where, fields);
 
     default:
       return `Operação '${operation}' não reconhecida ou não implementada.`;
@@ -288,8 +327,10 @@ async function executeDbOperation(jsonStr, userNumber) {
 }
 
 // ------------------------------------------------------
-// Handlers de INSERT, UPDATE, DELETE, SELECT
+// Handlers de INSERT / UPDATE / DELETE / SELECT
 // ------------------------------------------------------
+
+// 1) INSERT
 async function handleInsert(table, fields) {
   switch (table) {
     case 'patients':
@@ -301,7 +342,6 @@ async function handleInsert(table, fields) {
   }
 }
 
-// Insere paciente
 async function insertPatient(fields) {
   const {
     full_name,
@@ -337,16 +377,16 @@ async function insertPatient(fields) {
     data_anvisa || null,
     data_expiracao || null
   ]);
+
   return `Paciente inserido com ID=${insertRes.rows[0].id}.`;
 }
 
-// Insere transação (ENTRADA ou SAÍDA)
 async function insertTransaction(fields) {
   const {
     brand,
     product_name,
     quantity,
-    operation_type,   // ENTRADA ou SAÍDA
+    operation_type,
     patient_name,
     cost_in_real,
     cost_in_dollar,
@@ -372,35 +412,41 @@ async function insertTransaction(fields) {
   }
   const patientId = patRes.rows[0].id;
 
-  // Garante inventory
-  const inv = await pool.query(`SELECT id, quantity FROM inventory WHERE brand=$1 AND product_name=$2`,
-    [brand, product_name]);
+  // Verifica se já existe no inventory
+  const invRes = await pool.query(`
+    SELECT id, quantity FROM inventory
+    WHERE brand=$1 AND product_name=$2
+  `, [brand, product_name]);
+
   let productId;
   let newQty;
-  if (inv.rows.length > 0) {
-    productId = inv.rows[0].id;
-    const current = inv.rows[0].quantity || 0;
+  if (invRes.rows.length > 0) {
+    productId = invRes.rows[0].id;
+    const currentQ = invRes.rows[0].quantity || 0;
     if (operation_type === 'ENTRADA') {
-      newQty = current + quantity;
+      newQty = currentQ + quantity;
     } else {
-      newQty = current - quantity;
-      if (newQty < 0) newQty = 0; 
+      newQty = currentQ - quantity;
+      if (newQty < 0) {
+        newQty = 0; // ou poderia barrar se quiser
+      }
     }
     await pool.query(`UPDATE inventory SET quantity=$1 WHERE id=$2`, [newQty, productId]);
   } else {
-    const insInv = await pool.query(`
+    // Se não existe, criar
+    const invInsert = await pool.query(`
       INSERT INTO inventory (brand, product_name, quantity)
       VALUES ($1,$2,$3) RETURNING id
     `, [
       brand,
       product_name,
-      (operation_type === 'ENTRADA' ? quantity : 0)
+      (operation_type === 'ENTRADA') ? quantity : 0
     ]);
-    productId = insInv.rows[0].id;
+    productId = invInsert.rows[0].id;
     newQty = quantity;
   }
 
-  // Custos
+  // Calcular custos
   const fx = exchange_rate ? Number(exchange_rate) : 5.0;
   let cReal = cost_in_real ? Number(cost_in_real) : 0;
   let cDollar = cost_in_dollar ? Number(cost_in_dollar) : 0;
@@ -442,11 +488,12 @@ async function insertTransaction(fields) {
   return `Transação ID=${tid} inserida. Estoque de ${brand} / ${product_name} agora é ${newQty}.`;
 }
 
-// UPDATE genérico
+// 2) UPDATE
 async function handleUpdate(table, fields, where) {
   if (!Object.keys(where).length) {
     return 'WHERE não informado para UPDATE.';
   }
+
   const setParts = [];
   const vals = [];
   let idx = 1;
@@ -460,15 +507,17 @@ async function handleUpdate(table, fields, where) {
     vals.push(v);
   }
   const sql = `UPDATE ${table} SET ${setParts.join(', ')} WHERE ${whereParts.join(' AND ')}`;
+
   await pool.query(sql, vals);
   return `Registro(s) atualizado(s) em ${table}.`;
 }
 
-// DELETE genérico
+// 3) DELETE
 async function handleDelete(table, where) {
   if (!Object.keys(where).length) {
     return 'WHERE não informado para DELETE.';
   }
+
   const clauses = [];
   const vals = [];
   Object.entries(where).forEach(([k,v], i) => {
@@ -477,24 +526,65 @@ async function handleDelete(table, where) {
   });
   const sqlDel = `DELETE FROM ${table} WHERE ${clauses.join(' AND ')}`;
   await pool.query(sqlDel, vals);
+
   return `DELETE realizado em ${table} (where: ${JSON.stringify(where)})`;
 }
 
-// SELECT genérico
-async function handleSelect(table, where, data) {
-  let sql = `SELECT * FROM ${table}`;
-  const vals = [];
-  if (Object.keys(where).length) {
-    const clauses = [];
-    Object.entries(where).forEach(([k,v], i) => {
-      clauses.push(`${k}=$${i+1}`);
-      vals.push(v);
-    });
-    sql += ` WHERE ${clauses.join(' AND ')}`;
+// 4) SELECT (com possíveis agregados e intervalos de datas)
+async function handleSelect(table, where, fields) {
+  // "fields.aggregate" pode ser algo como "SUM(cost_in_real)" ou "COUNT(*)"
+  // "fields.date_start" e "fields.date_end" podem existir para filtrar datas
+  const { aggregate, date_start, date_end } = fields;
+
+  // Monta SELECT
+  let selectClause = '*';
+  if (aggregate) {
+    selectClause = `${aggregate} as result`; 
   }
-  const rows = (await pool.query(sql, vals)).rows;
-  if (!rows.length) return 'Nenhum resultado encontrado.';
-  return JSON.stringify(rows, null, 2);
+
+  let sql = `SELECT ${selectClause} FROM ${table}`;
+  const vals = [];
+  const clauses = [];
+
+  // Se for transactions, e tiver date_start ou date_end, filtramos date_of_sale
+  if (table === 'transactions') {
+    if (date_start) {
+      clauses.push(`date_of_sale >= $${vals.length+1}`);
+      vals.push(date_start);
+    }
+    if (date_end) {
+      clauses.push(`date_of_sale <= $${vals.length+1}`);
+      vals.push(date_end);
+    }
+  }
+
+  // Filtros do "where"
+  Object.entries(where).forEach(([k,v]) => {
+    // Ex: { operation_type: "SAÍDA" }
+    clauses.push(`${k}=$${vals.length+1}`);
+    vals.push(v);
+  });
+
+  if (clauses.length > 0) {
+    sql += ` WHERE ` + clauses.join(' AND ');
+  }
+
+  const res = await pool.query(sql, vals);
+
+  // Se foi um aggregate, retornamos o valor
+  if (aggregate) {
+    if (res.rows.length === 0 || res.rows[0].result === null) {
+      return `Resultado do agregado = 0 ou sem linhas.`;
+    }
+    return `Resultado da agregação: ${res.rows[0].result}`;
+  }
+
+  // Se não for agregação
+  if (!res.rows.length) {
+    return 'Nenhum resultado encontrado.';
+  }
+  // Retorna JSON
+  return JSON.stringify(res.rows, null, 2);
 }
 
 // ------------------------------------------------------
@@ -520,23 +610,19 @@ client.on('qr', (qr) => {
 
 client.on('ready', async () => {
   console.log('Bot conectado com sucesso!');
+  await initRedis();
   await initDB();
 });
 
-// --- SEÇÃO IMPORTANTE: FILTRO DE NÚMEROS ---
-// Se não quiser filtrar, basta comentar estas linhas:
 const allowedNumbers = [
-  // Exemplo de formato correto (com DDI 55, DDD e número)
-  // '5551998682720@c.us',
-  // '5551999551005@c.us'
+  // Se quiser restringir, insira no formato ex: '555199999999@c.us'
 ];
 
 client.on('message', async (msg) => {
   try {
-    // Se a lista de allowedNumbers estiver vazia, o bot responde a todos
-    // Se estiver preenchida, só responde aos que estão nela
+    // Filtrar por allowedNumbers
     if (allowedNumbers.length > 0 && !allowedNumbers.includes(msg.from)) {
-      return; // ignora
+      return;
     }
 
     const userNumber = msg.from;
