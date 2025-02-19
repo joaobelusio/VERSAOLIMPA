@@ -2,7 +2,7 @@
   "name": "whatsapp-openai-bot",
   "version": "1.0.0",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js || (echo '=== NPM DEBUG LOG ===' && cat /root/.npm/_logs/*.log || true)"
   },
   "dependencies": {
     "dotenv": "^16.0.0",
