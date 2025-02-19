@@ -586,7 +586,7 @@ client.on('ready', async () => {
 client.on('message', async (msg) => {
   try {
     // Filtrar para só aceitar mensagens de certos números
-    const allowedNumbers = ['51998682720@c.us','51999551005@c.us'];
+    const allowedNumbers = ['5551998682720@c.us','5551999551005@c.us'];
     if (!allowedNumbers.includes(msg.from)) {
       return; // ignora
     }
