@@ -48,13 +48,12 @@ const pool = new Pool({
 });
 
 // ===============================
-// 3) REDIS (para pendências)
+// 3) REDIS (para memória curta da conversa)
 // ===============================
 const redis = require('redis');
 const redisClient = redis.createClient({
-  url: process.env.REDIS_URL // Ex: "redis://default:senha@host:port"
+  url: "redis://default:JWnSISLuVfDxjlfqcoNKokfMRkqOcqsv@redis.railway.internal:6379"
 });
-
 redisClient.on('error', (err) => console.error('Erro no Redis:', err));
 redisClient.on('connect', () => console.log('Redis: conectando...'));
 redisClient.on('ready', () => console.log('Redis: conectado e pronto!'));
@@ -66,26 +65,31 @@ async function initRedis() {
   }
 }
 
-// Funções para pegar e setar "pendingOperation"
-async function getPendingOperation(userNumber) {
-  const key = `pendingOp:${userNumber}`;
-  const val = await redisClient.get(key);
-  console.log(`GET ${key} =>`, val);
-  return val;
-}
-async function setPendingOperation(userNumber, value) {
-  const key = `pendingOp:${userNumber}`;
-  if (value) {
-    await redisClient.set(key, value);
-    console.log(`SET ${key} =>`, value);
-  } else {
-    await redisClient.del(key);
-    console.log(`DEL ${key}`);
+// ===============================
+// 4) Funções para armazenar/ler histórico no Redis
+// ===============================
+const MAX_MESSAGES = 6; // quantas mensagens recentes manter (3 turnos)
+
+async function getConversationHistory(userNumber) {
+  const key = `conversationHistory:${userNumber}`;
+  const json = await redisClient.get(key);
+  if (!json) {
+    return []; // sem histórico
+  }
+  try {
+    return JSON.parse(json);
+  } catch {
+    return [];
   }
 }
 
+async function saveConversationHistory(userNumber, historyArray) {
+  const key = `conversationHistory:${userNumber}`;
+  await redisClient.set(key, JSON.stringify(historyArray));
+}
+
 // ===============================
-// 4) Cria tabelas + seeds no Postgres
+// 5) Cria tabelas + seeds no Postgres
 // ===============================
 async function initDB() {
   await pool.query(`
@@ -170,8 +174,7 @@ async function initDB() {
 }
 
 // ===============================
-// 5) System Prompt "forte"
-//    (explica para o ChatGPT as regras)
+// 6) System Prompt "forte"
 // ===============================
 const systemPrompt = `
 Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados **PostgreSQL**.
@@ -190,7 +193,7 @@ Você é um assistente que gerencia estoque e vendas de produtos à base de CBD 
 - "quantity": número
 - "operation_type": "ENTRADA" ou "SAÍDA"
 - "patient_name": string
-- "cost_in_real" ou "cost_in_dollar" (pode ser 0 se não tiver)
+- "cost_in_real" ou "cost_in_dollar"
 - "exchange_rate" (pode ser 5.0 se não tiver outro valor)
 
 ### Exemplo de JSON correto para SAÍDA:
@@ -216,7 +219,7 @@ Você é um assistente que gerencia estoque e vendas de produtos à base de CBD 
 \`\`\`
 
 ### Regras:
-1) Sempre responda com uma frase explicando o que entendeu/fará + um bloco de JSON (entre 3 crases).
+1) Sempre responda com uma frase explicando o que entendeu/fará + um bloco de JSON \`\`\`.
 2) Se faltarem dados, peça ao usuário e use "operation":"NONE".
 3) Se o usuário falar "dar alta de X frascos" ou "quero vender Y frascos", isso significa "operation_type":"SAÍDA".
 4) Se falar "comprei" ou "entrada", é "operation_type":"ENTRADA".
@@ -226,7 +229,7 @@ Você é um assistente que gerencia estoque e vendas de produtos à base de CBD 
 7) Se o usuário mandar algo genérico como "quanto vendemos em abril", use "operation":"SELECT", "table":"transactions", e coloque "fields":{"aggregate":"SUM(cost_in_real)"} e "date_start", "date_end" se souber as datas.
 
 ### Importante:
-- Siga **exatamente** a estrutura: "operation", "table", "fields", e "where" (quando precisar).
+- Use "operation", "table", "fields", "where" (quando precisar).
 - NUNCA use "data" em vez de "fields".
 - Se for INSERT em "transactions", inclua "operation_type" e "patient_name".
 - Para custo, use "cost_in_real" ou "cost_in_dollar" (nunca "cost_in_usd").
@@ -235,76 +238,84 @@ Boa sorte!
 `;
 
 // ===============================
-// 6) Função que chama ChatGPT e extrai JSON
+// 7) askGPT => agora usando histórico
 // ===============================
-async function askGPT(userText) {
-  const response = await openai.chat.completions.create({
+async function askGPT(userNumber, userText) {
+  // 1) Carrega histórico do Redis
+  let history = await getConversationHistory(userNumber);
+
+  // 2) Adiciona a nova mensagem do usuário
+  history.push({ role: 'user', content: userText });
+
+  // 3) Se exceder MAX_MESSAGES, remove do início
+  while (history.length > MAX_MESSAGES) {
+    history.shift();
+  }
+
+  // 4) Monta array final pro GPT: systemPrompt + history
+  const messagesForGPT = [
+    { role: 'system', content: systemPrompt },
+    ...history
+  ];
+
+  // 5) Chama GPT
+  const result = await openai.chat.completions.create({
     model: 'gpt-3.5-turbo',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userText }
-    ]
+    messages: messagesForGPT
   });
 
-  const answer = response.choices[0]?.message?.content || '';
-  // Extrair JSON do bloco ``` ```
-  const match = answer.match(/```([^`]+)```/s);
+  const fullAnswer = result.choices[0]?.message?.content || '';
+
+  // 6) Armazena a resposta do bot no histórico
+  history.push({ role: 'assistant', content: fullAnswer });
+
+  // 7) Se exceder, remove do início
+  while (history.length > MAX_MESSAGES) {
+    history.shift();
+  }
+
+  // 8) Salva de volta no Redis
+  await saveConversationHistory(userNumber, history);
+
+  // 9) Extrai o JSON
   let jsonPart = null;
+  const match = fullAnswer.match(/```([^`]+)```/s);
   if (match) {
     jsonPart = match[1].trim();
   }
-  return { answer, jsonPart };
+
+  return { fullAnswer, jsonPart };
 }
 
 // ===============================
-// 7) Lógica principal: pendências, GPT, etc.
+// 8) handleUserMessage
 // ===============================
 async function handleUserMessage(userNumber, userText) {
-  // 1) Verifica se há pendência
-  const pending = await getPendingOperation(userNumber);
-  let finalPrompt = userText;
+  // Chama askGPT, que já resgata e salva histórico
+  const { fullAnswer, jsonPart } = await askGPT(userNumber, userText);
 
-  if (pending) {
-    // Se existe pendência, combinamos
-    finalPrompt = `${pending}\n\nUsuário diz agora: "${userText}"`;
-    // Limpamos a pendência por enquanto
-    await setPendingOperation(userNumber, null);
-  }
-
-  // 2) Chama GPT
-  const { answer, jsonPart } = await askGPT(finalPrompt);
-
-  // 3) Corrige problemas no JSON que o GPT gerou
+  // Corrige JSON
   let fixedJson = jsonPart ? fixJsonCommonIssues(jsonPart) : null;
 
-  // 4) Executa no BD
   let dbMsg = 'Nenhuma operação de BD detectada.';
   if (fixedJson) {
     dbMsg = await executeDbOperation(fixedJson, userNumber);
-    // Se ainda faltam dados, marcamos pendência
-    if (dbMsg.includes('faltam dados') || dbMsg.includes('por favor forneça')) {
-      await setPendingOperation(userNumber, userText);
-    }
   }
 
-  return `${answer}\n\n[DB INFO]: ${dbMsg}`;
+  return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
 }
 
 // ===============================
-// 8) Corrige problemas comuns no JSON gerado
+// 9) Corrige problemas no JSON
 // ===============================
 function fixJsonCommonIssues(jsonStr) {
-  // Corrigir se o GPT usou "table":"stock" -> "table":"inventory"
   let fixed = jsonStr.replace(/"table":"stock"/gi, '"table":"inventory"');
-
-  // Corrigir se escreveu "cost_in_usd" em vez de "cost_in_dollar"
   fixed = fixed.replace(/cost_in_usd/gi, 'cost_in_dollar');
-
   return fixed;
 }
 
 // ===============================
-// 9) EXECUTA OPERAÇÃO NO BD
+// 10) EXECUTA OPERAÇÃO NO BD
 // ===============================
 async function executeDbOperation(jsonStr, userNumber) {
   let data;
@@ -317,10 +328,10 @@ async function executeDbOperation(jsonStr, userNumber) {
 
   const { operation, table, fields = {}, where = {} } = data;
   if (!operation || operation === 'NONE') {
-    return 'O GPT decidiu que não há nada para fazer (ou aguarda dados).';
+    return 'O GPT decidiu que não há nada para fazer.';
   }
 
-  // Se for Insert em transactions, tentamos "fuzzy matching"
+  // Fuzzy matching se for Insert em transactions
   if (operation === 'INSERT' && table === 'transactions' && fields.product_name) {
     const bestName = await findClosestProductName(fields.brand, fields.product_name);
     if (bestName && bestName !== fields.product_name) {
@@ -344,22 +355,18 @@ async function executeDbOperation(jsonStr, userNumber) {
 }
 
 // ===============================
-// 10) Fuzzy matching do product_name
+// 11) findClosestProductName
 // ===============================
 async function findClosestProductName(brand, userProductName) {
   if (!brand) return null;
-
-  // Pega lista oficial
   const res = await pool.query(`
     SELECT canonical_name
     FROM official_products
     WHERE brand ILIKE $1
   `, [brand]);
-
   if (res.rows.length === 0) {
     return null;
   }
-
   let bestScore = -1;
   let bestName = null;
   for (const row of res.rows) {
@@ -369,10 +376,9 @@ async function findClosestProductName(brand, userProductName) {
       bestName = row.canonical_name;
     }
   }
-  return bestName; // mesmo que seja baixo
+  return bestName;
 }
 
-// Exemplo simples de "similaridade"
 function stringSimilarity(a, b) {
   const aa = a.toLowerCase();
   const bb = b.toLowerCase();
@@ -384,8 +390,10 @@ function stringSimilarity(a, b) {
 }
 
 // ===============================
-// 11) Handlers de INSERT, UPDATE, DELETE, SELECT
+// 12) Handlers de INSERT, UPDATE, DELETE, SELECT
+// (igual ao seu código corrigido)
 // ===============================
+
 async function handleInsert(table, f) {
   if (table === 'patients') return insertPatient(f);
   if (table === 'transactions') return insertTransaction(f);
@@ -406,7 +414,7 @@ async function insertPatient(fields) {
   } = fields;
 
   if (!full_name) {
-    return 'Falta "full_name". Por favor forneça.';
+    return 'Falta "full_name".';
   }
 
   const res = await pool.query(`
@@ -445,20 +453,18 @@ async function insertTransaction(fields) {
     date_of_sale,
     sale_code
   } = fields;
-
-  // Valida
   if (!brand || !product_name || !quantity || !operation_type || !patient_name) {
-    return 'Campos obrigatórios faltando (brand, product_name, quantity, operation_type, patient_name).';
+    return 'Faltam campos obrigatórios.';
   }
 
-  // Pega ID do paciente
+  // Verifica paciente
   const pat = await pool.query(`SELECT id FROM patients WHERE full_name ILIKE $1`, [patient_name]);
   if (pat.rows.length === 0) {
-    return `Paciente '${patient_name}' não encontrado. Cadastre primeiro ou corrija.`;
+    return `Paciente '${patient_name}' não encontrado.`;
   }
   const patientId = pat.rows[0].id;
 
-  // Verifica/inserir inventory
+  // Inventory
   const inv = await pool.query(`
     SELECT id, quantity FROM inventory
     WHERE brand=$1 AND product_name=$2
@@ -477,21 +483,20 @@ async function insertTransaction(fields) {
     }
     await pool.query(`UPDATE inventory SET quantity=$1 WHERE id=$2`, [newQty, productId]);
   } else {
-    // se não existe, cria
     const ins = await pool.query(`
-      INSERT INTO inventory (brand, product_name, quantity)
-      VALUES ($1,$2,$3) RETURNING id
+      INSERT INTO inventory(brand, product_name, quantity)
+      VALUES($1,$2,$3) RETURNING id
     `, [
       brand,
       product_name,
-      (operation_type === 'ENTRADA' ? quantity : 0)
+      operation_type === 'ENTRADA' ? quantity : 0
     ]);
     productId = ins.rows[0].id;
     newQty = quantity;
   }
 
   // Custos
-  let fx = exchange_rate ? Number(exchange_rate) : 5.0;
+  const fx = exchange_rate ? Number(exchange_rate) : 5.0;
   let cReal = cost_in_real ? Number(cost_in_real) : 0;
   let cDollar = cost_in_dollar ? Number(cost_in_dollar) : 0;
   if (cReal === 0 && cDollar > 0) {
@@ -520,11 +525,11 @@ async function insertTransaction(fields) {
   `, [
     productId, operation_type, quantity,
     patientId, cReal, cDollar, fx,
-    sale_type||null,
+    sale_type || null,
     (paid === true || paid === "true") ? true : false,
-    payment_method||null,
+    payment_method || null,
     finalDate,
-    sale_code||null
+    sale_code || null
   ]);
 
   return `Transação inserida (ID=${tr.rows[0].id}). Estoque de "${brand} / ${product_name}" agora é ${newQty}.`;
@@ -587,16 +592,13 @@ async function handleSelect(table, where, fields) {
       vals.push(date_end);
     }
   }
-  // Filtros do "where"
   for (const [k,v] of Object.entries(where)) {
     clauses.push(`${k}=$${vals.length+1}`);
     vals.push(v);
   }
-
   if (clauses.length > 0) {
     sql += ` WHERE ` + clauses.join(' AND ');
   }
-
   const res = await pool.query(sql, vals);
 
   if (aggregate) {
@@ -606,7 +608,6 @@ async function handleSelect(table, where, fields) {
       return `Resultado do ${aggregate}: 0 (ou nada encontrado)`;
     }
   }
-
   if (res.rows.length === 0) {
     return 'Nenhum resultado encontrado.';
   }
@@ -614,10 +615,12 @@ async function handleSelect(table, where, fields) {
 }
 
 // ===============================
-// 12) Configura WA
+// 13) Configura WA
 // ===============================
-const client = new Client({
-  authStrategy: new LocalAuth(),
+const { Client: WabClient, LocalAuth: WabLocalAuth } = require('whatsapp-web.js');
+
+const client = new WabClient({
+  authStrategy: new WabLocalAuth(),
   puppeteer: {
     headless: true,
     args: [
@@ -636,22 +639,19 @@ client.on('qr', (qr) => {
 
 client.on('ready', async () => {
   console.log('Bot conectado ao WhatsApp!');
-  // Inicia Redis e Postgres
   await initRedis();
   await initDB();
 });
 
 const allowedNumbers = [
-  // Ex: '555199999999@c.us'
+  // '555199999999@c.us'
 ];
 
 client.on('message', async (msg) => {
   try {
-    // Se quiser filtrar
     if (allowedNumbers.length > 0 && !allowedNumbers.includes(msg.from)) {
       return;
     }
-
     const userNumber = msg.from;
     const userText = msg.body;
     console.log(`[MSG de ${userNumber}]: ${userText}`);
