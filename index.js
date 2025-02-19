@@ -53,8 +53,8 @@ const pool = new Pool({
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
-  port: process.env.PGPORT,
-  ssl: { rejectUnauthorized: false }, // Importante em Railway
+  port: parseInt(process.env.PGPORT, 10), // conversão para número
+  ssl: { rejectUnauthorized: false },
 });
 
 // ------------------------------------------------------
