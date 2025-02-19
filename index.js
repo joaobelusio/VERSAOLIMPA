@@ -39,23 +39,29 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ------------------------------------------------------
 // Conexão ao PostgreSQL (usando pg Pool)
+// Se seu Railway fornecer DATABASE_URL, poderia ser:
+//   const pool = new Pool({
+//     connectionString: process.env.DATABASE_URL,
+//     ssl: { rejectUnauthorized: false },
+//   });
+// Mas aqui seguimos usando as variáveis separadas (PGHOST, etc.)
 // ------------------------------------------------------
 const { Pool } = require('pg');
 
-// Se seu Railway fornecer DATABASE_URL, você pode usar:
-// const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-//
-// Caso contrário, use variáveis separadas (PGHOST, PGUSER, etc.):
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
-  port: process.env.PGPORT
+  port: process.env.PGPORT,
+  ssl: { rejectUnauthorized: false }, // Importante em Railway
 });
 
-// Cria tabelas se não existirem (exemplo simples)
+// ------------------------------------------------------
+// Função para criar tabelas se não existirem
+// ------------------------------------------------------
 async function initDB() {
+  // Cria tabela 'inventory' caso não exista
   await pool.query(`
     CREATE TABLE IF NOT EXISTS inventory (
       id SERIAL PRIMARY KEY,
@@ -65,6 +71,7 @@ async function initDB() {
     );
   `);
 
+  // Cria tabela 'transactions' caso não exista
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -119,7 +126,7 @@ Por favor, siga esse formato sempre.
 async function processUserMessage(userMessage) {
   // 1) Chama ChatGPT com a role 'system' e 'user'
   const response = await openai.chat.completions.create({
-    model: 'gpt-3.5-turbo', // use 'gpt-4' se tiver acesso
+    model: 'gpt-3.5-turbo', // ou 'gpt-4' se você tiver acesso
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userMessage }
@@ -128,21 +135,20 @@ async function processUserMessage(userMessage) {
 
   const fullAnswer = response.choices[0]?.message?.content || '';
 
-  // 2) Vamos extrair o JSON que está entre ``` e ```
-  //    Simplisticamente, use regex:
-  const jsonRegex = /```([^`]+)```/;
+  // 2) Extrai o JSON que está entre ``` e ```
+  const jsonRegex = /```([^`]+)```/s; // /s para dotall
   const match = fullAnswer.match(jsonRegex);
 
   let jsonPart = null;
   if (match) {
-    jsonPart = match[1]; // Conteúdo dentro de ```
+    jsonPart = match[1].trim(); // Conteúdo dentro de ```
   }
 
   return { fullAnswer, jsonPart };
 }
 
 // ------------------------------------------------------
-// Função que executa a query no BD baseado no JSON
+// Executa a query no BD baseado no JSON do GPT
 // ------------------------------------------------------
 async function executeDbOperation(jsonStr) {
   try {
@@ -157,30 +163,24 @@ async function executeDbOperation(jsonStr) {
       return 'O GPT decidiu que não há nada para fazer no BD.';
     }
 
-    // Exemplo simplificado de operações:
     switch (operation) {
       case 'INSERT':
         if (table === 'inventory') {
-          // Inserir novo produto ou, se já existir brand+product_name, atualizar
-          // Aqui faremos um insert ou upsert básico
+          // Se brand+product_name já existe, soma quantidades
           const { brand, product_name, quantity } = fields;
           if (!brand || !product_name) {
             return 'Faltam campos obrigatórios para INSERT em inventory.';
           }
-          // Tenta ver se já existe
           const checkRes = await pool.query(
             'SELECT id, quantity FROM inventory WHERE brand=$1 AND product_name=$2',
             [brand, product_name]
           );
           if (checkRes.rows.length > 0) {
-            // Já existe, então somamos as quantidades
+            // Atualiza
             const existingId = checkRes.rows[0].id;
             const newQty = checkRes.rows[0].quantity + (quantity || 0);
-            await pool.query(
-              'UPDATE inventory SET quantity=$1 WHERE id=$2',
-              [newQty, existingId]
-            );
-            // Pode inserir em transactions
+            await pool.query('UPDATE inventory SET quantity=$1 WHERE id=$2', [newQty, existingId]);
+            // Adiciona no transactions
             await pool.query(
               'INSERT INTO transactions (product_id, operation_type, quantity) VALUES ($1,$2,$3)',
               [existingId, 'ENTRADA', quantity || 0]
@@ -193,7 +193,6 @@ async function executeDbOperation(jsonStr) {
               [brand, product_name, quantity || 0]
             );
             const newId = insertRes.rows[0].id;
-            // E registra transaction
             await pool.query(
               'INSERT INTO transactions (product_id, operation_type, quantity) VALUES ($1,$2,$3)',
               [newId, 'ENTRADA', quantity || 0]
@@ -201,12 +200,11 @@ async function executeDbOperation(jsonStr) {
             return `Inserido novo produto ${brand} / ${product_name} (qtd: ${quantity || 0}).`;
           }
         }
-        // Você pode tratar "table === transactions" etc.
         return 'INSERT em outra tabela não implementado neste exemplo.';
 
       case 'UPDATE':
         if (table === 'inventory') {
-          // Exemplo: "UPDATE inventory SET fields WHERE brand=xx AND product_name=yy"
+          // Monta um UPDATE genérico
           const setParts = [];
           const values = [];
           let idx = 1;
@@ -230,7 +228,7 @@ async function executeDbOperation(jsonStr) {
 
       case 'DELETE':
         if (table === 'inventory') {
-          // Exemplo: "DELETE FROM inventory WHERE brand=xx AND product_name=yy"
+          // Monta um DELETE genérico
           const whereKeys = Object.keys(where);
           if (!whereKeys.length) {
             return 'WHERE não informado para DELETE.';
@@ -249,7 +247,7 @@ async function executeDbOperation(jsonStr) {
 
       case 'SELECT':
         if (table === 'inventory') {
-          // Exemplo: "SELECT * FROM inventory WHERE brand=xx"
+          // SELECT simples
           const whereKeys = Object.keys(where);
           let rows;
           if (whereKeys.length) {
@@ -267,7 +265,6 @@ async function executeDbOperation(jsonStr) {
           if (rows.length === 0) {
             return 'Nenhum resultado encontrado.';
           }
-          // Monta string de resposta
           let resp = 'Resultados:\n';
           rows.forEach(r => {
             resp += `ID=${r.id} | ${r.brand} / ${r.product_name} => Qtd: ${r.quantity}\n`;
@@ -324,12 +321,12 @@ client.on('message', async (message) => {
     // 1) Chama o GPT com systemPrompt e userMsg
     const { fullAnswer, jsonPart } = await processUserMessage(userMsg);
 
-    // 2) Tenta executar operação no BD, se houver
+    // 2) Tenta executar operação no BD (se houver)
     const dbResult = await executeDbOperation(jsonPart);
 
     // 3) Monta resposta final para o WhatsApp
-    //    - O GPT já fez uma frase explicando
-    //    - dbResult explica o que aconteceu no BD (se algo)
+    // GPT já fez uma frase explicando;
+    // dbResult diz o que ocorreu no BD
     const finalReply = `${fullAnswer}\n\n[DB INFO]: ${dbResult}`;
 
     await message.reply(finalReply);
