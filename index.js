@@ -28,6 +28,7 @@ function OldStyleOpenAIConstructor({ apiKey }) {
 openaiModule.default = OldStyleOpenAIConstructor;
 const { default: OpenAI } = openaiModule;
 
+// Verifica se temos a chave
 if (!process.env.OPENAI_API_KEY) {
   console.error('ERRO: OPENAI_API_KEY não definida!');
   process.exit(1);
@@ -48,12 +49,13 @@ const pool = new Pool({
 });
 
 // ===============================
-// 3) REDIS (para memória curta da conversa)
+// 3) REDIS
 // ===============================
 const redis = require('redis');
 const redisClient = redis.createClient({
-  url: process.env.REDIS_URL // "redis://default:senha@redis.railway.internal:6379"
+  url: process.env.REDIS_URL
 });
+
 redisClient.on('error', (err) => console.error('Erro no Redis:', err));
 redisClient.on('connect', () => console.log('Redis: conectando...'));
 redisClient.on('ready', () => console.log('Redis: conectado e pronto!'));
@@ -66,32 +68,30 @@ async function initRedis() {
 }
 
 // ===============================
-// 4) Funções para armazenar/ler histórico no Redis
+// 4) Memória curta da conversa (em Redis)
 // ===============================
-const MAX_MESSAGES = 6; // quantas mensagens recentes manter
+const MAX_MESSAGES = 6; // quantas mensagens manter
 
 async function getConversationHistory(userNumber) {
   const key = `conversationHistory:${userNumber}`;
   const json = await redisClient.get(key);
-  if (!json) {
-    return [];
-  }
+  if (!json) return [];
   try {
     return JSON.parse(json);
   } catch {
     return [];
   }
 }
-
-async function saveConversationHistory(userNumber, historyArray) {
+async function saveConversationHistory(userNumber, arr) {
   const key = `conversationHistory:${userNumber}`;
-  await redisClient.set(key, JSON.stringify(historyArray));
+  await redisClient.set(key, JSON.stringify(arr));
 }
 
 // ===============================
 // 5) Cria tabelas + seeds no Postgres
 // ===============================
 async function initDB() {
+  // Tabelas
   await pool.query(`
     CREATE TABLE IF NOT EXISTS official_products (
       id SERIAL PRIMARY KEY,
@@ -174,120 +174,57 @@ async function initDB() {
 }
 
 // ===============================
-// 6) System Prompt
+// 6) Prompt
 // ===============================
 const systemPrompt = `
 Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados **PostgreSQL**.
 
-### Tabelas válidas:
-- "patients"
-- "inventory"
-- "transactions"
-- "official_products"
-
-(NUNCA use "stock", "table":"stock" ou outra variação que não esteja na lista acima.)
-
-### Campos obrigatórios para "transactions" (INSERT):
-- "brand": string
-- "product_name": string (ex: "1Drop 6000mg Full Spectrum 30ml")
-- "quantity": número
-- "operation_type": "ENTRADA" ou "SAÍDA"
-- "patient_name": string
-- "cost_in_real" ou "cost_in_dollar"
-- "exchange_rate" (pode ser 5.0 se não tiver outro valor)
-
-### Exemplo de JSON correto para SAÍDA:
-\`\`\`
-{
-  "operation":"INSERT",
-  "table":"transactions",
-  "fields":{
-    "brand":"1DROP",
-    "product_name":"1Drop 6000mg Full Spectrum 30ml",
-    "quantity":2,
-    "operation_type":"SAÍDA",
-    "patient_name":"Fulano de Tal",
-    "sale_type":"Portaria",
-    "paid":true,
-    "payment_method":"pix",
-    "date_of_sale":"2025-03-01 10:00:00",
-    "cost_in_real":2000,
-    "cost_in_dollar":0,
-    "exchange_rate":5.2
-  }
-}
-\`\`\`
-
-### Regras:
-1) Sempre responda com uma frase explicando o que entendeu/fará + um bloco de JSON \`\`\`.
-2) Se faltarem dados, peça ao usuário e use "operation":"NONE".
-3) Se o usuário falar "dar alta de X frascos" ou "quero vender Y frascos", é "operation_type":"SAÍDA".
-4) Se falar "comprei" ou "entrada", é "operation_type":"ENTRADA".
-5) Se o usuário der um nome de produto informal (ex: "1drop 6000fs"), converta para "1Drop 6000mg Full Spectrum 30ml" (ou pergunte).
-6) Para SELECT, se o usuário disser "estoque atual", faça "operation":"SELECT", "table":"inventory", "where": { ... }.
-7) Se o usuário mandar algo genérico como "quanto vendemos em abril", use "operation":"SELECT", "table":"transactions", e "fields":{"aggregate":"SUM(cost_in_real)"} e datas etc.
-
-Boa sorte!
+# ... (Mesma descrição das regras e exemplos) ...
 `;
 
 // ===============================
-// 7) askGPT => usando histórico
+// 7) askGPT
 // ===============================
 async function askGPT(userNumber, userText) {
-  // Carrega histórico
-  let history = await getConversationHistory(userNumber);
+  const history = await getConversationHistory(userNumber);
 
-  // Nova msg do usuário
   history.push({ role: 'user', content: userText });
-  while (history.length > MAX_MESSAGES) {
-    history.shift();
-  }
+  while (history.length > MAX_MESSAGES) history.shift();
 
-  // Monta arr final
   const messagesForGPT = [
     { role: 'system', content: systemPrompt },
     ...history
   ];
 
-  // Chama GPT
   const response = await openai.chat.completions.create({
     model: 'gpt-3.5-turbo',
     messages: messagesForGPT
   });
   const fullAnswer = response.choices[0]?.message?.content || '';
 
-  // Armazena resposta
   history.push({ role: 'assistant', content: fullAnswer });
-  while (history.length > MAX_MESSAGES) {
-    history.shift();
-  }
+  while (history.length > MAX_MESSAGES) history.shift();
+
   await saveConversationHistory(userNumber, history);
 
-  // Extrai JSON (com fallback)
   const jsonPart = extractJsonBlock(fullAnswer);
 
   return { fullAnswer, jsonPart };
 }
 
-// ===============================
 // Regex fallback
-// ===============================
 function extractJsonBlock(fullAnswer) {
-  // 1) Tenta triple backticks
-  const tripleRegex = /```([\s\S]+)```/;
-  const tripleMatch = fullAnswer.match(tripleRegex);
+  // Tenta triple backticks
+  const triple = /```([\s\S]+)```/;
+  const tripleMatch = fullAnswer.match(triple);
   if (tripleMatch) {
     return tripleMatch[1].trim();
   }
 
-  // 2) Tenta "json" e captura do 1o '{' até a última '}'
-  //    De forma bem agressiva (pode haver multiline).
-  //    Exemplo: "json\n{ ... }"
-  const fallbackRegex = /json[\s\S]*?(\{[\s\S]+\})/;
-  const fallbackMatch = fullAnswer.match(fallbackRegex);
-  if (fallbackMatch) {
-    return fallbackMatch[1].trim();
-  }
+  // Tenta "json" e do 1o '{' até a última '}'
+  const fallback = /json[\s\S]*?(\{[\s\S]+\})/;
+  const match2 = fullAnswer.match(fallback);
+  if (match2) return match2[1].trim();
 
   return null;
 }
@@ -297,19 +234,14 @@ function extractJsonBlock(fullAnswer) {
 // ===============================
 async function handleUserMessage(userNumber, userText) {
   const { fullAnswer, jsonPart } = await askGPT(userNumber, userText);
-
   let dbMsg = 'Nenhuma operação de BD detectada.';
   if (jsonPart) {
-    const fixedJson = fixJsonCommonIssues(jsonPart);
-    dbMsg = await executeDbOperation(fixedJson);
+    const fixed = fixJsonCommonIssues(jsonPart);
+    dbMsg = await executeDbOperation(fixed);
   }
-
   return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
 }
 
-// ===============================
-// 9) Corrige problemas
-// ===============================
 function fixJsonCommonIssues(jsonStr) {
   let fixed = jsonStr.replace(/"table":"stock"/gi, '"table":"inventory"');
   fixed = fixed.replace(/cost_in_usd/gi, 'cost_in_dollar');
@@ -317,14 +249,14 @@ function fixJsonCommonIssues(jsonStr) {
 }
 
 // ===============================
-// 10) EXECUTA OPERAÇÃO NO BD
+// 9) executeDbOperation
 // ===============================
 async function executeDbOperation(jsonStr) {
   let data;
   try {
     data = JSON.parse(jsonStr);
   } catch (err) {
-    console.error('ERRO parse JSON:', err, jsonStr);
+    console.error('ERRO parse JSON:', err);
     return 'JSON inválido ou erro ao fazer parse.';
   }
 
@@ -333,7 +265,7 @@ async function executeDbOperation(jsonStr) {
     return 'O GPT decidiu que não há nada para fazer.';
   }
 
-  // Fuzzy matching se for Insert em transactions
+  // Se for insert com product_name, fuzzy
   if (operation === 'INSERT' && table === 'transactions' && fields.product_name) {
     const bestName = await findClosestProductName(fields.brand, fields.product_name);
     if (bestName && bestName !== fields.product_name) {
@@ -343,22 +275,15 @@ async function executeDbOperation(jsonStr) {
   }
 
   switch (operation) {
-    case 'INSERT':
-      return await handleInsert(table, fields);
-    case 'UPDATE':
-      return await handleUpdate(table, fields, where);
-    case 'DELETE':
-      return await handleDelete(table, where);
-    case 'SELECT':
-      return await handleSelect(table, where, fields);
+    case 'INSERT': return await handleInsert(table, fields);
+    case 'UPDATE': return await handleUpdate(table, fields, where);
+    case 'DELETE': return await handleDelete(table, where);
+    case 'SELECT': return await handleSelect(table, where, fields);
     default:
       return `Operação '${operation}' não reconhecida.`;
   }
 }
 
-// ===============================
-// 11) Fuzzy matching
-// ===============================
 async function findClosestProductName(brand, userProductName) {
   if (!brand) return null;
   const res = await pool.query(`
@@ -366,11 +291,9 @@ async function findClosestProductName(brand, userProductName) {
     FROM official_products
     WHERE brand ILIKE $1
   `, [brand]);
-  if (res.rows.length === 0) {
-    return null;
-  }
-  let bestScore = -1;
-  let bestName = null;
+  if (!res.rows.length) return null;
+
+  let bestScore = -1, bestName = null;
   for (const row of res.rows) {
     const score = stringSimilarity(row.canonical_name, userProductName);
     if (score > bestScore) {
@@ -380,6 +303,7 @@ async function findClosestProductName(brand, userProductName) {
   }
   return bestName;
 }
+
 function stringSimilarity(a, b) {
   const aa = a.toLowerCase();
   const bb = b.toLowerCase();
@@ -391,25 +315,18 @@ function stringSimilarity(a, b) {
 }
 
 // ===============================
-// 12) Handlers
+// 10) Handlers
 // ===============================
-async function handleInsert(table, f) {
-  if (table === 'patients') return insertPatient(f);
-  if (table === 'transactions') return insertTransaction(f);
+async function handleInsert(table, fields) {
+  if (table === 'patients') return insertPatient(fields);
+  if (table === 'transactions') return insertTransaction(fields);
   return `INSERT em '${table}' não implementado.`;
 }
 
 async function insertPatient(fields) {
   const {
-    full_name,
-    email,
-    user_gov,
-    password_gov,
-    medico,
-    endereco,
-    prescricao,
-    data_anvisa,
-    data_expiracao
+    full_name, email, user_gov, password_gov,
+    medico, endereco, prescricao, data_anvisa, data_expiracao
   } = fields;
 
   if (!full_name) {
@@ -438,40 +355,30 @@ async function insertPatient(fields) {
 
 async function insertTransaction(fields) {
   const {
-    brand,
-    product_name,
-    quantity,
-    operation_type,
-    patient_name,
-    cost_in_real,
-    cost_in_dollar,
-    exchange_rate,
-    sale_type,
-    paid,
-    payment_method,
-    date_of_sale,
-    sale_code
+    brand, product_name, quantity, operation_type,
+    patient_name, cost_in_real, cost_in_dollar,
+    exchange_rate, sale_type, paid, payment_method,
+    date_of_sale, sale_code
   } = fields;
+
   if (!brand || !product_name || !quantity || !operation_type || !patient_name) {
     return 'Faltam campos obrigatórios.';
   }
-
   // Verifica paciente
   const pat = await pool.query(`SELECT id FROM patients WHERE full_name ILIKE $1`, [patient_name]);
-  if (pat.rows.length === 0) {
+  if (!pat.rows.length) {
     return `Paciente '${patient_name}' não encontrado.`;
   }
   const patientId = pat.rows[0].id;
 
-  // Inventory
+  // inventory
   const inv = await pool.query(`
     SELECT id, quantity FROM inventory
     WHERE brand=$1 AND product_name=$2
   `, [brand, product_name]);
 
-  let productId;
-  let newQty;
-  if (inv.rows.length > 0) {
+  let productId, newQty;
+  if (inv.rows.length) {
     productId = inv.rows[0].id;
     const current = inv.rows[0].quantity || 0;
     if (operation_type === 'ENTRADA') {
@@ -494,7 +401,7 @@ async function insertTransaction(fields) {
     newQty = quantity;
   }
 
-  // Custos
+  // custos
   const fx = exchange_rate ? Number(exchange_rate) : 5.0;
   let cReal = cost_in_real ? Number(cost_in_real) : 0;
   let cDollar = cost_in_dollar ? Number(cost_in_dollar) : 0;
@@ -504,14 +411,11 @@ async function insertTransaction(fields) {
     cDollar = cReal / fx;
   }
 
-  // Data
+  // data
   let finalDate = date_of_sale ? new Date(date_of_sale) : null;
   if (!finalDate || isNaN(finalDate.getTime())) {
-    if (operation_type === 'SAÍDA') {
-      finalDate = new Date();
-    } else {
-      finalDate = null;
-    }
+    if (operation_type === 'SAÍDA') finalDate = new Date();
+    else finalDate = null;
   }
 
   const tr = await pool.query(`
@@ -524,11 +428,11 @@ async function insertTransaction(fields) {
   `, [
     productId, operation_type, quantity,
     patientId, cReal, cDollar, fx,
-    sale_type || null,
-    (paid === true || paid === "true") ? true : false,
-    payment_method || null,
+    sale_type||null,
+    (paid===true || paid==="true") ? true : false,
+    payment_method||null,
     finalDate,
-    sale_code || null
+    sale_code||null
   ]);
 
   return `Transação inserida (ID=${tr.rows[0].id}). Estoque de "${brand} / ${product_name}" agora é ${newQty}.`;
@@ -554,7 +458,6 @@ async function handleUpdate(table, fields, where) {
   await pool.query(sql, vals);
   return `Registro(s) atualizado(s) em ${table}.`;
 }
-
 async function handleDelete(table, where) {
   if (!Object.keys(where).length) {
     return 'WHERE não informado.';
@@ -569,7 +472,6 @@ async function handleDelete(table, where) {
   await pool.query(sql, vals);
   return `DELETE realizado em ${table} (where: ${JSON.stringify(where)})`;
 }
-
 async function handleSelect(table, where, fields) {
   const { aggregate, date_start, date_end } = fields;
   let sel = '*';
@@ -580,7 +482,6 @@ async function handleSelect(table, where, fields) {
   const vals = [];
   const clauses = [];
 
-  // Se for transactions e tiver date_start / date_end
   if (table === 'transactions') {
     if (date_start) {
       clauses.push(`date_of_sale >= $${vals.length+1}`);
@@ -595,19 +496,19 @@ async function handleSelect(table, where, fields) {
     clauses.push(`${k}=$${vals.length+1}`);
     vals.push(v);
   }
-  if (clauses.length > 0) {
+  if (clauses.length) {
     sql += ` WHERE ` + clauses.join(' AND ');
   }
   const res = await pool.query(sql, vals);
 
   if (aggregate) {
-    if (res.rows.length > 0 && res.rows[0].result != null) {
+    if (res.rows.length && res.rows[0].result != null) {
       return `Resultado do ${aggregate}: ${res.rows[0].result}`;
     } else {
       return `Resultado do ${aggregate}: 0 (ou nada encontrado)`;
     }
   }
-  if (res.rows.length === 0) {
+  if (!res.rows.length) {
     return 'Nenhum resultado encontrado.';
   }
   return JSON.stringify(res.rows, null, 2);
@@ -617,7 +518,11 @@ async function handleSelect(table, where, fields) {
 // 13) Configura WA
 // ===============================
 const client = new Client({
-  authStrategy: new LocalAuth(),
+  // Apontamos explicitamente para uma pasta
+  // que iremos COMMITAR no Git (.wwebjs_auth).
+  authStrategy: new LocalAuth({
+    dataPath: './.wwebjs_auth' 
+  }),
   puppeteer: {
     headless: true,
     args: [
@@ -636,7 +541,6 @@ client.on('qr', (qr) => {
 
 client.on('ready', async () => {
   console.log('Bot conectado ao WhatsApp!');
-  // Inicia Redis e Postgres
   await initRedis();
   await initDB();
 });
@@ -656,7 +560,6 @@ client.on('message', async (msg) => {
 
     const responseText = await handleUserMessage(userNumber, userText);
     await msg.reply(responseText);
-
   } catch (err) {
     console.error('Erro ao processar msg:', err);
     await msg.reply('Desculpe, ocorreu um erro ao processar sua solicitação.');
