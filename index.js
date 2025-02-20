@@ -2,9 +2,9 @@ require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 
-// ===============================
+// ------------------------------------------------------
 // 1) OPENAI "velha sintaxe"
-// ===============================
+// ------------------------------------------------------
 const openaiModule = require('openai');
 function OldStyleOpenAIConstructor({ apiKey }) {
   const { Configuration, OpenAIApi } = openaiModule;
@@ -28,16 +28,15 @@ function OldStyleOpenAIConstructor({ apiKey }) {
 openaiModule.default = OldStyleOpenAIConstructor;
 const { default: OpenAI } = openaiModule;
 
-// Verifica se temos a chave
 if (!process.env.OPENAI_API_KEY) {
   console.error('ERRO: OPENAI_API_KEY não definida!');
   process.exit(1);
 }
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ===============================
-// 2) POSTGRES
-// ===============================
+// ------------------------------------------------------
+// 2) POSTGRES (Pool)
+// ------------------------------------------------------
 const { Pool } = require('pg');
 const pool = new Pool({
   host: process.env.PGHOST,
@@ -48,14 +47,13 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ===============================
+// ------------------------------------------------------
 // 3) REDIS
-// ===============================
+// ------------------------------------------------------
 const redis = require('redis');
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL
 });
-
 redisClient.on('error', (err) => console.error('Erro no Redis:', err));
 redisClient.on('connect', () => console.log('Redis: conectando...'));
 redisClient.on('ready', () => console.log('Redis: conectado e pronto!'));
@@ -67,10 +65,10 @@ async function initRedis() {
   }
 }
 
-// ===============================
-// 4) Memória curta da conversa (em Redis)
-// ===============================
-const MAX_MESSAGES = 6; // quantas mensagens manter
+// ------------------------------------------------------
+// 4) Memória curta (Redis)
+// ------------------------------------------------------
+const MAX_MESSAGES = 6;
 
 async function getConversationHistory(userNumber) {
   const key = `conversationHistory:${userNumber}`;
@@ -82,16 +80,16 @@ async function getConversationHistory(userNumber) {
     return [];
   }
 }
+
 async function saveConversationHistory(userNumber, arr) {
   const key = `conversationHistory:${userNumber}`;
   await redisClient.set(key, JSON.stringify(arr));
 }
 
-// ===============================
-// 5) Cria tabelas + seeds no Postgres
-// ===============================
+// ------------------------------------------------------
+// 5) Cria tabelas + seeds
+// ------------------------------------------------------
 async function initDB() {
-  // Tabelas
   await pool.query(`
     CREATE TABLE IF NOT EXISTS official_products (
       id SERIAL PRIMARY KEY,
@@ -125,7 +123,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
       product_id INTEGER NOT NULL REFERENCES inventory(id),
-      operation_type TEXT NOT NULL, -- ENTRADA ou SAÍDA
+      operation_type TEXT NOT NULL,
       quantity INTEGER NOT NULL,
       created_at TIMESTAMP DEFAULT NOW(),
 
@@ -173,38 +171,65 @@ async function initDB() {
   console.log('Seeds de official_products inseridos (se faltava).');
 }
 
-// ===============================
-// 6) Prompt
-// ===============================
+// ------------------------------------------------------
+// 6) System Prompt "forte"
+// ------------------------------------------------------
 const systemPrompt = `
-Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados **PostgreSQL**.
+Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados PostgreSQL.
 
-# ... (Mesma descrição das regras e exemplos) ...
+Regras IMPORTANTES:
+1) NÃO pergunte se pode executar. Se tiver dados suficientes, GERE a operação (INSERT, UPDATE, DELETE, SELECT) e pronto. 
+2) Se faltar algum dado crítico (por ex. se o usuário pediu para adicionar medicamento mas não disse a marca), então peça e use "operation":"NONE".
+3) Retorne SEMPRE JSON válido com "operation", "table", "fields"/"where". 
+4) Se for SELECT, retorne "operation":"SELECT", "table":"inventory" ou "transactions", etc., e "where": {...}. 
+5) Se for inserir ou atualizar, "operation_type" = "ENTRADA" ou "SAÍDA" para transações. 
+6) NUNCA peça confirmação. Execute diretamente.
+7) Retorne a resposta em português, mas com um bloco de JSON no final. Se não precisar de operação, use "operation":"NONE".
+
+Exemplo:
+"Ok, inseri 5 frascos de 1Drop."
+\`\`\`
+{
+  "operation":"INSERT",
+  "table":"transactions",
+  "fields":{
+    ...
+  }
+}
+\`\`\`
+Boa sorte!
 `;
 
-// ===============================
-// 7) askGPT
-// ===============================
+// ------------------------------------------------------
+// 7) askGPT => com esse System Prompt
+// ------------------------------------------------------
 async function askGPT(userNumber, userText) {
   const history = await getConversationHistory(userNumber);
 
+  // Adiciona a mensagem do usuário ao histórico
   history.push({ role: 'user', content: userText });
-  while (history.length > MAX_MESSAGES) history.shift();
+  while (history.length > MAX_MESSAGES) {
+    history.shift();
+  }
 
   const messagesForGPT = [
     { role: 'system', content: systemPrompt },
     ...history
   ];
 
+  // Chama GPT
   const response = await openai.chat.completions.create({
     model: 'gpt-3.5-turbo',
     messages: messagesForGPT
   });
+
   const fullAnswer = response.choices[0]?.message?.content || '';
 
+  // Salva resposta no histórico
   history.push({ role: 'assistant', content: fullAnswer });
-  while (history.length > MAX_MESSAGES) history.shift();
-
+  while (history.length > MAX_MESSAGES) {
+    history.shift();
+  }
   await saveConversationHistory(userNumber, history);
 
   const jsonPart = extractJsonBlock(fullAnswer);
@@ -212,32 +237,36 @@ async function askGPT(userNumber, userText) {
   return { fullAnswer, jsonPart };
 }
 
-// Regex fallback
+// ------------------------------------------------------
+// Regex fallback para extrair JSON
+// ------------------------------------------------------
 function extractJsonBlock(fullAnswer) {
-  // Tenta triple backticks
+  // 1) Tenta triple backticks
   const triple = /```([\s\S]+)```/;
   const tripleMatch = fullAnswer.match(triple);
   if (tripleMatch) {
     return tripleMatch[1].trim();
   }
 
-  // Tenta "json" e do 1o '{' até a última '}'
+  // 2) Tenta fallback "json { ... }"
   const fallback = /json[\s\S]*?(\{[\s\S]+\})/;
   const match2 = fullAnswer.match(fallback);
-  if (match2) return match2[1].trim();
+  if (match2) {
+    return match2[1].trim();
+  }
 
   return null;
 }
 
-// ===============================
-// 8) handleUserMessage
-// ===============================
+// ------------------------------------------------------
+// 8) HandleUserMessage
+// ------------------------------------------------------
 async function handleUserMessage(userNumber, userText) {
   const { fullAnswer, jsonPart } = await askGPT(userNumber, userText);
+
   let dbMsg = 'Nenhuma operação de BD detectada.';
   if (jsonPart) {
-    const fixed = fixJsonCommonIssues(jsonPart);
-    dbMsg = await executeDbOperation(fixed);
+    dbMsg = await executeDbOperation(jsonPart);
   }
   return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
 }
@@ -248,10 +277,13 @@ function fixJsonCommonIssues(jsonStr) {
   return fixed;
 }
 
-// ===============================
+// ------------------------------------------------------
 // 9) executeDbOperation
-// ===============================
+// ------------------------------------------------------
 async function executeDbOperation(jsonStr) {
+  // Ajusta possíveis divergências
+  jsonStr = fixJsonCommonIssues(jsonStr);
+
   let data;
   try {
     data = JSON.parse(jsonStr);
@@ -265,25 +297,30 @@ async function executeDbOperation(jsonStr) {
     return 'O GPT decidiu que não há nada para fazer.';
   }
 
-  // Se for insert com product_name, fuzzy
+  // Fuzzy matching se for Insert em transactions
   if (operation === 'INSERT' && table === 'transactions' && fields.product_name) {
     const bestName = await findClosestProductName(fields.brand, fields.product_name);
     if (bestName && bestName !== fields.product_name) {
-      console.log(`Corrigindo product_name de "${fields.product_name}" para "${bestName}".`);
+      console.log(`Corrigindo product_name de "${fields.product_name}" => "${bestName}".`);
       fields.product_name = bestName;
     }
   }
 
   switch (operation) {
-    case 'INSERT': return await handleInsert(table, fields);
-    case 'UPDATE': return await handleUpdate(table, fields, where);
-    case 'DELETE': return await handleDelete(table, where);
-    case 'SELECT': return await handleSelect(table, where, fields);
+    case 'INSERT':
+      return await handleInsert(table, fields);
+    case 'UPDATE':
+      return await handleUpdate(table, fields, where);
+    case 'DELETE':
+      return await handleDelete(table, where);
+    case 'SELECT':
+      return await handleSelect(table, where, fields);
     default:
       return `Operação '${operation}' não reconhecida.`;
   }
 }
 
+// Fuzzy
 async function findClosestProductName(brand, userProductName) {
   if (!brand) return null;
   const res = await pool.query(`
@@ -303,7 +340,6 @@ async function findClosestProductName(brand, userProductName) {
   }
   return bestName;
 }
-
 function stringSimilarity(a, b) {
   const aa = a.toLowerCase();
   const bb = b.toLowerCase();
@@ -314,23 +350,30 @@ function stringSimilarity(a, b) {
   return matches / aa.length;
 }
 
-// ===============================
+// ------------------------------------------------------
 // 10) Handlers
-// ===============================
-async function handleInsert(table, fields) {
-  if (table === 'patients') return insertPatient(fields);
-  if (table === 'transactions') return insertTransaction(fields);
+// ------------------------------------------------------
+async function handleInsert(table, f) {
+  if (table === 'patients') return insertPatient(f);
+  if (table === 'transactions') return insertTransaction(f);
   return `INSERT em '${table}' não implementado.`;
 }
 
 async function insertPatient(fields) {
   const {
-    full_name, email, user_gov, password_gov,
-    medico, endereco, prescricao, data_anvisa, data_expiracao
+    full_name,
+    email,
+    user_gov,
+    password_gov,
+    medico,
+    endereco,
+    prescricao,
+    data_anvisa,
+    data_expiracao
   } = fields;
 
   if (!full_name) {
-    return 'Falta "full_name".';
+    return 'Falta "full_name". (operation=NONE?)';
   }
 
   const res = await pool.query(`
@@ -355,19 +398,29 @@ async function insertPatient(fields) {
 
 async function insertTransaction(fields) {
   const {
-    brand, product_name, quantity, operation_type,
-    patient_name, cost_in_real, cost_in_dollar,
-    exchange_rate, sale_type, paid, payment_method,
-    date_of_sale, sale_code
+    brand,
+    product_name,
+    quantity,
+    operation_type,
+    patient_name,
+    cost_in_real,
+    cost_in_dollar,
+    exchange_rate,
+    sale_type,
+    paid,
+    payment_method,
+    date_of_sale,
+    sale_code
   } = fields;
 
   if (!brand || !product_name || !quantity || !operation_type || !patient_name) {
-    return 'Faltam campos obrigatórios.';
+    return 'Faltam campos obrigatórios para inserir transação.';
   }
+
   // Verifica paciente
   const pat = await pool.query(`SELECT id FROM patients WHERE full_name ILIKE $1`, [patient_name]);
   if (!pat.rows.length) {
-    return `Paciente '${patient_name}' não encontrado.`;
+    return `Paciente '${patient_name}' não encontrado. (Cadastre antes ou corrija o nome)`;
   }
   const patientId = pat.rows[0].id;
 
@@ -389,19 +442,20 @@ async function insertTransaction(fields) {
     }
     await pool.query(`UPDATE inventory SET quantity=$1 WHERE id=$2`, [newQty, productId]);
   } else {
+    // se não existe, cria
     const ins = await pool.query(`
       INSERT INTO inventory(brand, product_name, quantity)
       VALUES($1,$2,$3) RETURNING id
     `, [
       brand,
       product_name,
-      operation_type === 'ENTRADA' ? quantity : 0
+      (operation_type === 'ENTRADA' ? quantity : 0)
     ]);
     productId = ins.rows[0].id;
     newQty = quantity;
   }
 
-  // custos
+  // Custos
   const fx = exchange_rate ? Number(exchange_rate) : 5.0;
   let cReal = cost_in_real ? Number(cost_in_real) : 0;
   let cDollar = cost_in_dollar ? Number(cost_in_dollar) : 0;
@@ -411,11 +465,14 @@ async function insertTransaction(fields) {
     cDollar = cReal / fx;
   }
 
-  // data
+  // Data
   let finalDate = date_of_sale ? new Date(date_of_sale) : null;
   if (!finalDate || isNaN(finalDate.getTime())) {
-    if (operation_type === 'SAÍDA') finalDate = new Date();
-    else finalDate = null;
+    if (operation_type === 'SAÍDA') {
+      finalDate = new Date();
+    } else {
+      finalDate = null;
+    }
   }
 
   const tr = await pool.query(`
@@ -458,6 +515,7 @@ async function handleUpdate(table, fields, where) {
   await pool.query(sql, vals);
   return `Registro(s) atualizado(s) em ${table}.`;
 }
+
 async function handleDelete(table, where) {
   if (!Object.keys(where).length) {
     return 'WHERE não informado.';
@@ -472,6 +530,7 @@ async function handleDelete(table, where) {
   await pool.query(sql, vals);
   return `DELETE realizado em ${table} (where: ${JSON.stringify(where)})`;
 }
+
 async function handleSelect(table, where, fields) {
   const { aggregate, date_start, date_end } = fields;
   let sel = '*';
@@ -514,14 +573,13 @@ async function handleSelect(table, where, fields) {
   return JSON.stringify(res.rows, null, 2);
 }
 
-// ===============================
+// ------------------------------------------------------
 // 13) Configura WA
-// ===============================
+// ------------------------------------------------------
 const client = new Client({
-  // Apontamos explicitamente para uma pasta
-  // que iremos COMMITAR no Git (.wwebjs_auth).
+  // Usa LocalAuth com dataPath => .wwebjs_auth
   authStrategy: new LocalAuth({
-    dataPath: './.wwebjs_auth' 
+    dataPath: './.wwebjs_auth'
   }),
   puppeteer: {
     headless: true,
@@ -560,6 +618,7 @@ client.on('message', async (msg) => {
 
     const responseText = await handleUserMessage(userNumber, userText);
     await msg.reply(responseText);
+
   } catch (err) {
     console.error('Erro ao processar msg:', err);
     await msg.reply('Desculpe, ocorreu um erro ao processar sua solicitação.');
