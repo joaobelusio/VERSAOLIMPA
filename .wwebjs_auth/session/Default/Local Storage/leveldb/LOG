@@ -1,3 +1,2 @@
-2025/02/20-14:36:50.232 8370 Reusing MANIFEST C:\Users\joaop\OneDrive\Documentos\versao-limpa-whatsapp\.wwebjs_auth\session\Default\Local Storage\leveldb/MANIFEST-000001
-2025/02/20-14:36:50.235 8370 Recovering log #3
-2025/02/20-14:36:50.235 8370 Reusing old log C:\Users\joaop\OneDrive\Documentos\versao-limpa-whatsapp\.wwebjs_auth\session\Default\Local Storage\leveldb/000003.log 
+2025/02/20-15:08:25.891 a188 Creating DB C:\Users\joaop\OneDrive\Documentos\versao-limpa-whatsapp\.wwebjs_auth\session\Default\Local Storage\leveldb since it was missing.
+2025/02/20-15:08:25.902 a188 Reusing MANIFEST C:\Users\joaop\OneDrive\Documentos\versao-limpa-whatsapp\.wwebjs_auth\session\Default\Local Storage\leveldb/MANIFEST-000001
