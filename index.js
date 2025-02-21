@@ -1,23 +1,25 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const { Pool } = require('pg');
-const redis = require('redis');
-const openaiModule = require('openai');
 
-// ---------------------------
-// 1) Config do OpenAI
-// ---------------------------
+// ------------------------------------------------------
+// 1) OPENAI "velha sintaxe"
+// ------------------------------------------------------
+const openaiModule = require('openai');
 function OldStyleOpenAIConstructor({ apiKey }) {
   const { Configuration, OpenAIApi } = openaiModule;
+  
   const configuration = new Configuration({ apiKey });
   const apiInstance = new OpenAIApi(configuration);
+
   return {
     chat: {
       completions: {
         create: async (params) => {
           const result = await apiInstance.createChatCompletion(params);
-          return { choices: result.data.choices };
+          return {
+            choices: result.data.choices
+          };
         }
       }
     }
@@ -25,15 +27,17 @@ function OldStyleOpenAIConstructor({ apiKey }) {
 }
 openaiModule.default = OldStyleOpenAIConstructor;
 const { default: OpenAI } = openaiModule;
+
 if (!process.env.OPENAI_API_KEY) {
-  console.error('Falta OPENAI_API_KEY');
+  console.error('ERRO: OPENAI_API_KEY não definida!');
   process.exit(1);
 }
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------------------------
-// 2) Postgres
-// ---------------------------
+// ------------------------------------------------------
+// 2) POSTGRES (Pool)
+// ------------------------------------------------------
+const { Pool } = require('pg');
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
@@ -43,43 +47,91 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ---------------------------
-// 3) Redis
-// ---------------------------
+// ------------------------------------------------------
+// 3) REDIS
+// ------------------------------------------------------
+const redis = require('redis');
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL
 });
-redisClient.on('error', (err) => console.error('Redis Error:', err));
-redisClient.on('ready', () => console.log('Redis pronto!'));
+redisClient.on('error', (err) => console.error('Erro no Redis:', err));
+redisClient.on('connect', () => console.log('Redis: conectando...'));
+redisClient.on('ready', () => console.log('Redis: conectado e pronto!'));
+
 async function initRedis() {
   if (!redisClient.isOpen) {
     await redisClient.connect();
+    console.log('Conectado ao Redis!');
   }
 }
 
-// ---------------------------
-// 4) Tabelas + seeds
-// ---------------------------
+// ------------------------------------------------------
+// 4) Memória curta (Redis)
+// ------------------------------------------------------
+const MAX_MESSAGES = 6;
+
+async function getConversationHistory(userNumber) {
+  const key = `conversationHistory:${userNumber}`;
+  const json = await redisClient.get(key);
+  if (!json) return [];
+  try {
+    return JSON.parse(json);
+  } catch {
+    return [];
+  }
+}
+
+async function saveConversationHistory(userNumber, arr) {
+  const key = `conversationHistory:${userNumber}`;
+  await redisClient.set(key, JSON.stringify(arr));
+}
+
+// ------------------------------------------------------
+// 5) Cria tabelas + seeds
+// ------------------------------------------------------
 async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS official_products (
+      id SERIAL PRIMARY KEY,
+      brand TEXT NOT NULL,
+      canonical_name TEXT NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS patients (
+      id SERIAL PRIMARY KEY,
+      full_name TEXT NOT NULL,
+      email TEXT,
+      user_gov TEXT,
+      password_gov TEXT,
+      medico TEXT,
+      endereco TEXT,
+      prescricao TEXT,
+      data_anvisa DATE,
+      data_expiracao DATE
+    );
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS inventory (
       id SERIAL PRIMARY KEY,
       brand TEXT NOT NULL,
       product_name TEXT NOT NULL,
-      quantity INT NOT NULL DEFAULT 0
+      quantity INTEGER NOT NULL DEFAULT 0
     );
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
-      product_id INT NOT NULL REFERENCES inventory(id),
-      operation_type TEXT NOT NULL, -- ENTRADA ou SAÍDA
-      quantity INT NOT NULL,
+      product_id INTEGER NOT NULL REFERENCES inventory(id),
+      operation_type TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
       created_at TIMESTAMP DEFAULT NOW(),
+
+      patient_id INTEGER REFERENCES patients(id),
       cost_in_real NUMERIC,
       cost_in_dollar NUMERIC,
       exchange_rate NUMERIC,
-      patient_id INT,
+
       sale_type TEXT,
       paid BOOLEAN,
       payment_method TEXT,
@@ -87,221 +139,548 @@ async function initDB() {
       sale_code TEXT
     );
   `);
-  // ... e assim por diante ...
-  console.log('DB ok!');
+
+  console.log('Tabelas criadas/atualizadas se não existiam.');
+
+  // Seeds
+  const seedProducts = [
+    ['1DROP', '1Drop 1500mg Full Spectrum 30ml'],
+    ['1DROP', '1Drop 2100mg (1500mg Full Spectrum + 300mg CBG + 300mg D8-THC) 30ml'],
+    ['1DROP', '1Drop 2250mg BroadSpectrum (1500mg Full Spectrum + 750mg CBG) com zero THC 30ml'],
+    ['1DROP', '1Drop 6000mg CBD Isolado 30ml'],
+    ['1DROP', '1Drop 6000mg Full Spectrum 30ml'],
+    ['1DROP', '1Drop Gummies 900mg/30 unidades por frasco 10:1:1 (750mg de CBD + 75mg de D9-THC + 75mg de CBG) Full Spectrum Zero Açúcar'],
+    ['KannabidiOil', 'KannabidiOil 1800mg (1500mg Full Spectrum +300mg CBN + Melatonina) 30ml'],
+    ['KannabidiOil', 'KannabidiOil 1800mg (1500mg Full Spectrum e +300mg D8-THC) + Vitamina D 30ml'],
+    ['KannabidiOil', 'KannabidiOil Gummies BLISS+ 1050mg/30un (25mg de CBD, 5mg de D9-THC e 5mg de CBG por bala)'],
+    ['KannabidiOil', 'KannabidiOil Gummies ANS+ 1050mg/30un (25mg de CBD, 5mg de D9-THC e 5mg de CBN por bala)'],
+    ['KannabidiOil', 'KannabidiOil Gummies 600mg/10un (50mg de cbd, 5mg de D9-THC e 5mg de CBG)'],
+    ['LIBERI', 'LIBERI 6000mg CBD Isolado (+Vitamina D)'],
+    ['LIBERI', 'LIBERI 1800mg (1500mg de Full Spectrum + 300mg de D8-THC) 30ml'],
+    ['VITA10', 'VITA10 3000mg Full Spectrum'],
+  ];
+  for (const [brand, canonical_name] of seedProducts) {
+    await pool.query(
+      `
+      INSERT INTO official_products (brand, canonical_name)
+      SELECT $1, $2
+      WHERE NOT EXISTS (
+        SELECT 1 FROM official_products WHERE brand=$1 AND canonical_name=$2
+      )
+      `,
+      [brand, canonical_name]
+    );
+  }
+  console.log('Seeds de official_products inseridos (se faltava).');
 }
 
-// ---------------------------
-// 5) States in Redis
-// ---------------------------
-async function getState(user) {
-  const val = await redisClient.get(`state:${user}`);
-  return val ? JSON.parse(val) : {};
-}
-async function saveState(user, state) {
-  await redisClient.set(`state:${user}`, JSON.stringify(state));
-}
+// ------------------------------------------------------
+// 6) System Prompt "forte"
+// ------------------------------------------------------
+/**
+ * *** MUDANÇA IMPORTANTE ***:
+ * Inserimos a instrução para que o GPT, se perceber que faltam dados cruciais,
+ * PERGUNTE ao usuário (e retorne operation=NONE) ao invés de gerar INSERT incompleto.
+ */
+const systemPrompt = `
+Você é um assistente que gerencia estoque e vendas de produtos à base de CBD em um banco de dados PostgreSQL.
 
-// ---------------------------
-// 6) Lógica de parse manual
-// ---------------------------
-// Exemplo simples: "Quero 48 frascos de 1drop 6000 a 21k dolar"
-function tryParseTransaction(userText) {
-  // Procurar algo como "(\d+) frascos de (.*?)( a ([\d.]+)(k)? (reais|dolar|dólar))?"
-  // É só um exemplo simples, pode precisar de melhorias
-  const re = /(\d+)\s*frascos? de\s+([^\s]+)(?:.*?\b(\d+(?:\.\d+)?)\s*(k)?\s*(reais|dolar|dólar))?/i;
-  const match = userText.match(re);
-  if (!match) return null;
+Regras IMPORTANTES:
+1) Se tiver dados suficientes (brand, product_name, quantity, operation_type) gere o JSON. Se "patient_name" não vier, pode ficar nulo. Não bloqueie.
+2) Se faltar dado essencial (por ex. não sabe se é ENTRADA ou SAÍDA), pergunte. Use "operation":"NONE".
+3) Retorne SEMPRE JSON válido com "operation", "table", "fields"/"where".
+4) Se for SELECT, retorne "operation":"SELECT", "table":"inventory" ou "transactions", etc.
+5) Se for inserir ou atualizar, "operation_type" = "ENTRADA" ou "SAÍDA" (para transações).
+6) Se o usuário diz "vender" ou "quero X", interprete como SAÍDA. Se diz "adicionar", interprete como ENTRADA. Se tiver dúvida, pergunte.
+7) "brand" e "product_name" devem ser separados. Se o usuário disser "1drop 6000", tente converter brand= "1DROP", product_name="1Drop 6000mg CBD Isolado 30ml" (se for esse). Caso não tenha certeza, pergunte.
+8) Retorne a resposta em português e ao final um bloco JSON. Se não precisar de operação, "operation":"NONE".
 
-  const quantity = parseInt(match[1], 10);
-  let brandOrProduct = match[2]; // ex: "1drop" ou "1drop 6000"
-  // Valor
-  let rawValue = match[3];
-  const isK = match[4]; // se "k"
-  const moneyType = match[5]; // "reais" ou "dolar"
-  let costValue = null;
-  if (rawValue) {
-    // se for "21" e isK => 21000
-    const baseNum = parseFloat(rawValue);
-    costValue = isK ? baseNum * 1000 : baseNum;
+Exemplo:
+"Ok, inseri 5 frascos de 1Drop."
+\`\`\`
+{
+  "operation":"INSERT",
+  "table":"transactions",
+  "fields":{
+    ...
+  }
+}
+\`\`\`
+Boa sorte!
+`;
+
+// ------------------------------------------------------
+// 7) askGPT => com esse System Prompt
+// ------------------------------------------------------
+async function askGPT(userNumber, userText) {
+  const history = await getConversationHistory(userNumber);
+
+  // Adiciona a mensagem do usuário ao histórico
+  history.push({ role: 'user', content: userText });
+  while (history.length > MAX_MESSAGES) {
+    history.shift();
   }
 
-  let costInReal = null, costInDollar = null;
-  if (moneyType) {
-    const low = moneyType.toLowerCase();
-    if (low.includes('real')) {
-      costInReal = costValue;
-    } else {
-      costInDollar = costValue;
-    }
+  const messagesForGPT = [
+    { role: 'system', content: systemPrompt },
+    ...history
+  ];
+
+  // Chama GPT
+  const response = await openai.chat.completions.create({
+    model: 'gpt-3.5-turbo',
+    messages: messagesForGPT
+  });
+
+  const fullAnswer = response.choices[0]?.message?.content || '';
+
+  // Salva resposta no histórico
+  history.push({ role: 'assistant', content: fullAnswer });
+  while (history.length > MAX_MESSAGES) {
+    history.shift();
   }
-  return {
-    quantity,
-    brandOrProduct,
-    costInReal,
-    costInDollar
-  };
+  await saveConversationHistory(userNumber, history);
+
+  const jsonPart = extractJsonBlock(fullAnswer);
+
+  return { fullAnswer, jsonPart };
 }
 
-// ---------------------------
-// 7) handleUserMessage
-// ---------------------------
+// ------------------------------------------------------
+// Regex para extrair JSON
+// ------------------------------------------------------
+function extractJsonBlock(fullAnswer) {
+  // 1) Tenta com crases (backticks) usando uma expressão mais ampla:
+  const tripleRegex = /```(?:json)?\s*([\s\S]*?)```/;
+  const tripleMatch = fullAnswer.match(tripleRegex);
+  if (tripleMatch) {
+    return tripleMatch[1].trim();
+  }
+
+  // 2) fallback
+  const fallback = /\{[\s\S]*?\}(\s|$)/;
+  const match2 = fullAnswer.match(fallback);
+  if (match2) {
+    return match2[0].trim();
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------
+// 8) HandleUserMessage
+// ------------------------------------------------------
 async function handleUserMessage(userNumber, userText) {
-  // 1) Ver se user quer algo do tipo "quero X frascos"
-  let parsed = tryParseTransaction(userText);
-  if (parsed) {
-    // Supondo que seja SAÍDA
-    // e assumimos brand="1DROP" se userText contém "1drop" etc...
-    // Adapte a fuzi logic
-    let brand = "1DROP";
-    if (parsed.brandOrProduct.toLowerCase().includes("kannab")) brand = "KannabidiOil";
-    // ou faça fuzzy se quiser
-    // ...
-    const costInReal = parsed.costInReal || 0;
-    const costInDollar = parsed.costInDollar || 0;
-    // 'patient_name' => ID=??? ou 0
-    // Vamos inserir
-    const resultMsg = await doInsertTransaction({
-      brand,
-      product_name: "1Drop 6000mg Full Spectrum 30ml", // for example
-      quantity: parsed.quantity,
-      operation_type: "SAÍDA",
-      cost_in_real: costInReal,
-      cost_in_dollar: costInDollar
-    });
-    return `Ok! ${resultMsg}`;
-  }
+  const { fullAnswer, jsonPart } = await askGPT(userNumber, userText);
 
-  // 2) Se user diz "quantos 1drop temos?"
-  if (/quantos.*1drop/i.test(userText)) {
-    // do SELECT
-    const selectMsg = await doSelectInventory("1DROP");
-    return selectMsg;
+  let dbMsg = 'Nenhuma operação de BD detectada.';
+  if (jsonPart) {
+    dbMsg = await executeDbOperation(jsonPart);
   }
-
-  // 3) Se user pergunta algo como "quanto vendemos no mes X"
-  if (/quanto vendemos/i.test(userText)) {
-    // Deixa GPT responder algo... Exemplo:
-    const gptResp = await askGPT_ApenasConsultoria(userText);
-    return gptResp;
-  }
-
-  // Senão, fallback
-  return "Não entendi. Pode reformular?";
+  return `${fullAnswer}\n\n[DB INFO]: ${dbMsg}`;
 }
 
-// Exemplo: Insert transaction
-async function doInsertTransaction(fields) {
-  // 1) Verifica se item existe em inventory
-  const invRes = await pool.query(`
-    SELECT id, quantity FROM inventory
-    WHERE brand=$1 AND product_name=$2
-  `, [fields.brand, fields.product_name]);
+function fixJsonCommonIssues(jsonStr) {
+  // substitui "product" por "product_name", se existir
+  // *** MUDANÇA *** Para corrigir a questão de "product" vs "product_name"
+  let fixed = jsonStr.replace(/"product"\s*:/gi, '"product_name":');
 
-  let productId, newQty;
-  if (invRes.rows.length > 0) {
-    productId = invRes.rows[0].id;
-    const current = invRes.rows[0].quantity || 0;
-    if (fields.operation_type === 'ENTRADA') {
-      newQty = current + fields.quantity;
-    } else {
-      newQty = current - fields.quantity;
-      if (newQty < 0) newQty = 0;
-    }
-    await pool.query(`UPDATE inventory SET quantity=$1 WHERE id=$2`, [newQty, productId]);
-  } else {
-    // Se nao existe, cria
-    const ins = await pool.query(`
-      INSERT INTO inventory (brand, product_name, quantity)
-      VALUES($1,$2,$3) RETURNING id
-    `, [
-      fields.brand,
-      fields.product_name,
-      (fields.operation_type === 'ENTRADA') ? fields.quantity : 0
-    ]);
-    productId = ins.rows[0].id;
-    newQty = fields.quantity;
+  // substitui "table":"stock" por "table":"inventory"
+  fixed = fixed.replace(/"table":"stock"/gi, '"table":"inventory"');
+
+  // substitui cost_in_usd -> cost_in_dollar
+  fixed = fixed.replace(/cost_in_usd/gi, 'cost_in_dollar');
+  
+  // caso existam aspas duplas mal formatadas, etc, podemos tentar correções adicionais
+
+  return fixed;
+}
+
+// ------------------------------------------------------
+// 9) executeDbOperation
+// ------------------------------------------------------
+async function executeDbOperation(jsonStr) {
+  // Ajusta possíveis divergências
+  jsonStr = fixJsonCommonIssues(jsonStr);
+
+  let data;
+  try {
+    data = JSON.parse(jsonStr);
+  } catch (err) {
+    console.error('ERRO parse JSON:', err);
+    return 'JSON inválido ou erro ao fazer parse.';
   }
 
-  // Insert transactions
+  const { operation, table, fields = {}, where = {} } = data;
+  if (!operation || operation === 'NONE') {
+    return 'O GPT decidiu que não há nada para fazer.';
+  }
+
+  // antes de disparar para DB, se for transação, tentamos heurísticas
+  if (operation === 'INSERT' && table === 'transactions') {
+    // *** MUDANÇA ***: Tentar inferir operation_type se não vier
+    if (!fields.operation_type) {
+      // Heurística: se o texto do usuário tinha "adicionar", ENTÃO "ENTRADA",
+      // senão se tinha "vender", "comprar" ou "quero X frascos", ENTÃO "SAÍDA"
+      // (esta heurística poderia ser refinada)
+      const lastUserMsg = (await getConversationHistory(table))?.slice(-1)?.[0]?.content || '';
+      // Mas aqui, simplifico e assumo "SAÍDA"
+      fields.operation_type = "SAÍDA";
+    }
+  }
+
+  switch (operation) {
+    case 'INSERT':
+      return await handleInsert(table, fields);
+    case 'UPDATE':
+      return await handleUpdate(table, fields, where);
+    case 'DELETE':
+      return await handleDelete(table, where);
+    case 'SELECT':
+      return await handleSelect(table, where, fields);
+    default:
+      return `Operação '${operation}' não reconhecida.`;
+  }
+}
+
+// Fuzzy Matching
+async function findClosestProductName(brand, userProductName) {
+  if (!brand) return null;
+  const res = await pool.query(
+    `SELECT canonical_name
+     FROM official_products
+     WHERE brand ILIKE $1`,
+    [brand]
+  );
+  if (!res.rows.length) return null;
+
+  let bestScore = -1, bestName = null;
+  for (const row of res.rows) {
+    const score = stringSimilarity(row.canonical_name, userProductName);
+    if (score > bestScore) {
+      bestScore = score;
+      bestName = row.canonical_name;
+    }
+  }
+  return bestName;
+}
+
+function stringSimilarity(a, b) {
+  const aa = a.toLowerCase();
+  const bb = b.toLowerCase();
+  // Pode ser uma lógica mais elaborada, mas aqui apenas um count simples
+  let matches = 0;
+  for (let ch of bb) {
+    if (aa.includes(ch)) matches++;
+  }
+  return matches / aa.length;
+}
+
+// ------------------------------------------------------
+// 10) Handlers
+// ------------------------------------------------------
+async function handleInsert(table, f) {
+  if (table === 'patients') return insertPatient(f);
+  if (table === 'transactions') return insertTransaction(f);
+  return `INSERT em '${table}' não implementado.`;
+}
+
+async function insertPatient(fields) {
+  const {
+    full_name,
+    email,
+    user_gov,
+    password_gov,
+    medico,
+    endereco,
+    prescricao,
+    data_anvisa,
+    data_expiracao
+  } = fields;
+
+  if (!full_name) {
+    return 'Falta "full_name". (operation=NONE?)';
+  }
+
   const res = await pool.query(`
-    INSERT INTO transactions(
-      product_id, operation_type, quantity,
-      cost_in_real, cost_in_dollar, exchange_rate
-    ) VALUES($1,$2,$3,$4,$5,$6)
+    INSERT INTO patients(
+      full_name, email, user_gov, password_gov, medico,
+      endereco, prescricao, data_anvisa, data_expiracao
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
     RETURNING id
   `, [
-    productId,
-    fields.operation_type,
-    fields.quantity,
-    fields.cost_in_real || 0,
-    fields.cost_in_dollar || 0,
-    fields.exchange_rate || 5.0
+    full_name || null,
+    email || null,
+    user_gov || null,
+    password_gov || null,
+    medico || null,
+    endereco || null,
+    prescricao || null,
+    data_anvisa || null,
+    data_expiracao || null
   ]);
-  return `Transação ID=${res.rows[0].id} inserida. Estoque = ${newQty}.`;
+  return `Paciente inserido com ID=${res.rows[0].id}.`;
 }
 
-// Exemplo: SELECT inventory
-async function doSelectInventory(brand) {
-  const res = await pool.query(`
-    SELECT * FROM inventory WHERE brand=$1
-  `, [brand]);
-  if (!res.rows.length) return `Não há itens da marca ${brand}.`;
-  let msg = `Estoque da marca ${brand}:\n`;
-  res.rows.forEach(r => {
-    msg += `- ${r.product_name}: ${r.quantity}\n`;
-  });
-  return msg;
+async function insertTransaction(fields) {
+  let {
+    brand,
+    product_name,
+    quantity,
+    operation_type,
+    patient_name,
+    cost_in_real,
+    cost_in_dollar,
+    exchange_rate,
+    sale_type,
+    paid,
+    payment_method,
+    date_of_sale,
+    sale_code
+  } = fields;
+
+  // *** MUDANÇA ***: brand e product_name obrigatórios,
+  // mas se não vier brand, tentamos separar "product_name"
+  if (!brand && product_name) {
+    // Exemplo de heurística: se "product_name" começar com "1drop",
+    // definimos brand = "1DROP". Caso contrário, pedimos fuzzy. (Simplificado!)
+    const matchBrand = (product_name || '').match(/^(\S+)/);
+    if (matchBrand) {
+      brand = matchBrand[1].toUpperCase();
+    }
+  }
+
+  if (!brand || !product_name || !quantity) {
+    return 'Faltam campos obrigatórios (brand, product_name ou quantity).';
+  }
+
+  // operation_type - se não vier, definimos "SAÍDA"
+  if (!operation_type) {
+    operation_type = 'SAÍDA';
+  }
+
+  // Faz fuzzy matching do product_name
+  const bestName = await findClosestProductName(brand, product_name);
+  if (bestName) {
+    product_name = bestName;
+  }
+
+  // Se tem patient_name, buscar. Se não, patient_id = null
+  let patientId = null;
+  if (patient_name) {
+    const pat = await pool.query(`
+      SELECT id FROM patients WHERE full_name ILIKE $1
+    `, [patient_name]);
+    if (!pat.rows.length) {
+      // Cria ou retorna erro? Aqui simplesmente definimos nulo, ou poderíamos criar
+      // return `Paciente '${patient_name}' não encontrado. Cadastre antes ou corrija o nome.`;
+      // *** MUDANÇA ***: setar nulo e seguir
+      patientId = null;
+    } else {
+      patientId = pat.rows[0].id;
+    }
+  }
+
+  // inventory
+  const inv = await pool.query(`
+    SELECT id, quantity FROM inventory
+    WHERE brand=$1 AND product_name=$2
+  `, [brand, product_name]);
+
+  let productId, newQty;
+  if (inv.rows.length) {
+    productId = inv.rows[0].id;
+    const current = inv.rows[0].quantity || 0;
+    if (operation_type === 'ENTRADA') {
+      newQty = current + quantity;
+    } else {
+      newQty = current - quantity;
+      if (newQty < 0) newQty = 0; // ou poderia bloquear
+    }
+    await pool.query(`
+      UPDATE inventory SET quantity=$1 WHERE id=$2
+    `, [newQty, productId]);
+  } else {
+    // se não existe, cria
+    const ins = await pool.query(`
+      INSERT INTO inventory(brand, product_name, quantity)
+      VALUES($1,$2,$3) RETURNING id
+    `, [
+      brand,
+      product_name,
+      (operation_type === 'ENTRADA' ? quantity : 0)
+    ]);
+    productId = ins.rows[0].id;
+    newQty = (operation_type === 'ENTRADA') ? quantity : 0;
+  }
+
+  // Custos
+  const fx = exchange_rate ? Number(exchange_rate) : 5.0;
+  let cReal = cost_in_real ? Number(cost_in_real) : 0;
+  let cDollar = cost_in_dollar ? Number(cost_in_dollar) : 0;
+  if (cReal === 0 && cDollar > 0) {
+    cReal = cDollar * fx;
+  } else if (cDollar === 0 && cReal > 0) {
+    cDollar = cReal / fx;
+  }
+
+  // Data
+  let finalDate = date_of_sale ? new Date(date_of_sale) : null;
+  if (!finalDate || isNaN(finalDate.getTime())) {
+    if (operation_type === 'SAÍDA') {
+      finalDate = new Date();
+    } else {
+      finalDate = null;
+    }
+  }
+
+  // Insert
+  const tr = await pool.query(`
+    INSERT INTO transactions(
+      product_id, operation_type, quantity,
+      patient_id, cost_in_real, cost_in_dollar, exchange_rate,
+      sale_type, paid, payment_method, date_of_sale, sale_code
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    RETURNING id
+  `, [
+    productId, operation_type, quantity,
+    patientId, cReal, cDollar, fx,
+    sale_type||null,
+    (paid===true || paid==="true") ? true : false,
+    payment_method||null,
+    finalDate,
+    sale_code||null
+  ]);
+
+  return `Transação inserida (ID=${tr.rows[0].id}). Estoque de "${brand} / ${product_name}" agora é ${newQty}.`;
 }
 
-// Exemplo: GPT para perguntas livres
-async function askGPT_ApenasConsultoria(text) {
-  // Se user pergunta "quanto vendemos no mes X"
-  // Chamamos GPT e deixamos ele responder livre
-  const resp = await openai.chat.completions.create({
-    model: 'gpt-3.5-turbo',
-    messages: [
-      { role: 'system', content: "Você é um consultor de vendas, mas não gera JSON. Responda em português." },
-      { role: 'user', content: text }
-    ]
+async function handleUpdate(table, fields, where) {
+  if (!Object.keys(where).length) {
+    return 'WHERE não informado.';
+  }
+  const setParts = [];
+  const vals = [];
+  let idx = 1;
+  for (const [k,v] of Object.entries(fields)) {
+    setParts.push(`${k}=$${idx++}`);
+    vals.push(v);
+  }
+  const whereParts = [];
+  for (const [k,v] of Object.entries(where)) {
+    whereParts.push(`${k}=$${idx++}`);
+    vals.push(v);
+  }
+  const sql = `UPDATE ${table} SET ${setParts.join(', ')} WHERE ${whereParts.join(' AND ')}`;
+  await pool.query(sql, vals);
+  return `Registro(s) atualizado(s) em ${table}.`;
+}
+
+async function handleDelete(table, where) {
+  if (!Object.keys(where).length) {
+    return 'WHERE não informado.';
+  }
+  const clauses = [];
+  const vals = [];
+  Object.entries(where).forEach(([k,v], i) => {
+    clauses.push(`${k}=$${i+1}`);
+    vals.push(v);
   });
-  return resp.choices[0]?.message?.content || "Desculpe, não entendi.";
+  const sql = `DELETE FROM ${table} WHERE ${clauses.join(' AND ')}`;
+  await pool.query(sql, vals);
+  return `DELETE realizado em ${table} (where: ${JSON.stringify(where)})`;
+}
+
+async function handleSelect(table, where, fields) {
+  const { aggregate, date_start, date_end } = fields;
+  let sel = '*';
+  if (aggregate) {
+    sel = `${aggregate} as result`;
+  }
+  let sql = `SELECT ${sel} FROM ${table}`;
+  const vals = [];
+  const clauses = [];
+
+  if (table === 'transactions') {
+    if (date_start) {
+      clauses.push(`date_of_sale >= $${vals.length+1}`);
+      vals.push(date_start);
+    }
+    if (date_end) {
+      clauses.push(`date_of_sale <= $${vals.length+1}`);
+      vals.push(date_end);
+    }
+  }
+  for (const [k,v] of Object.entries(where)) {
+    clauses.push(`${k}=$${vals.length+1}`);
+    vals.push(v);
+  }
+  if (clauses.length) {
+    sql += ` WHERE ` + clauses.join(' AND ');
+  }
+  const res = await pool.query(sql, vals);
+
+  if (aggregate) {
+    if (res.rows.length && res.rows[0].result != null) {
+      return `Resultado do ${aggregate}: ${res.rows[0].result}`;
+    } else {
+      return `Resultado do ${aggregate}: 0 (ou nada encontrado)`;
+    }
+  }
+  if (!res.rows.length) {
+    return 'Nenhum resultado encontrado.';
+  }
+  return JSON.stringify(res.rows, null, 2);
 }
 
 // ------------------------------------------------------
-// 11) WA
+// 13) Configura WA
 // ------------------------------------------------------
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
+  authStrategy: new LocalAuth({
+    dataPath: './.wwebjs_auth'
+  }),
   puppeteer: {
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
   }
 });
 
 client.on('qr', (qr) => {
-  console.log('QR code gerado:');
+  console.log('QR Code gerado, aponte a câmera do WhatsApp:');
   qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', async () => {
-  console.log('WhatsApp pronto!');
-  await initDB();
+  console.log('Bot conectado ao WhatsApp!');
   await initRedis();
+  await initDB();
 });
+
+const allowedNumbers = [
+  // '555199999999@c.us'
+];
 
 client.on('message', async (msg) => {
   try {
-    // Se quiser filtrar ...
-    const user = msg.from;
+    if (allowedNumbers.length > 0 && !allowedNumbers.includes(msg.from)) {
+      return;
+    }
+    const userNumber = msg.from;
     const userText = msg.body;
-    console.log(`[${user}]: ${userText}`);
+    console.log(`[MSG de ${userNumber}]: ${userText}`);
 
-    const resp = await handleUserMessage(user, userText);
-    await msg.reply(resp);
-  } catch(e) {
-    console.error('Erro:', e);
-    await msg.reply('Erro interno...');
+    const responseText = await handleUserMessage(userNumber, userText);
+    await msg.reply(responseText);
+
+  } catch (err) {
+    console.error('Erro ao processar msg:', err);
+    await msg.reply('Desculpe, ocorreu um erro ao processar sua solicitação.');
   }
 });
 
